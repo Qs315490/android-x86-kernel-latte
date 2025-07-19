@@ -86,7 +86,9 @@ jobs:
           if-no-files-found: error
   package-kernel:
     name: Package kernel
-    needs: build-kernels
+    needs: 
+        - prepare-kernels
+        - build-kernels
     runs-on: ubuntu-24.04
     strategy:
         matrix:
