@@ -19,7 +19,7 @@ fi
 for kernel in $kernels; do
 	echo "Building kernel $kernel"
 	KCONFIG_NOTIMESTAMP=1 KBUILD_BUILD_TIMESTAMP='' KBUILD_BUILD_USER=Qs315490 KBUILD_BUILD_HOST=localhost \
-		make -C "./kernels/$kernel" -j"$NTHREADS" O=out EXTART_CFLAGS="-std=gnu11" || { echo "Kernel build failed"; exit 1; }
+		make -C "./kernels/$kernel" -j"$NTHREADS" O=out CFLAGS_KERNEL="-std=gnu11" || { echo "Kernel build failed"; exit 1; }
 	rm -f "./kernels/$kernel/out/source"
 	if [ -f "$MOK_KEY" ] && [ -f "$MOK_CERT" ]; then
 		echo "Signing kernel $kernel"

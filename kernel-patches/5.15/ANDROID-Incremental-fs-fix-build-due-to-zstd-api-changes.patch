@@ -1,0 +1,45 @@
+From b258009529eab900ab9b670929b616bef1c89155 Mon Sep 17 00:00:00 2001
+From: Greg Kroah-Hartman <gregkh@google.com>
+Date: Tue, 23 Nov 2021 11:44:52 +0100
+Subject: [PATCH] ANDROID: Incremental fs: fix build due to zstd api changes
+
+Commit cf30f6a5f0c6 ("lib: zstd: Add kernel-specific API") changed the
+zstd api.  Given that the incfs code is not in the kernel tree, it was
+not also converted so do that here to keep the build working properly.
+
+Fixes: cf30f6a5f0c6 ("lib: zstd: Add kernel-specific API")
+Signed-off-by: Greg Kroah-Hartman <gregkh@google.com>
+Change-Id: I2e786a5e032adf104c0f3778bfb516a58c134047
+---
+
+diff --git a/fs/incfs/data_mgmt.c b/fs/incfs/data_mgmt.c
+index fbab68a..a3c782a 100644
+--- a/fs/incfs/data_mgmt.c
++++ b/fs/incfs/data_mgmt.c
+@@ -433,7 +433,7 @@ static ssize_t zstd_decompress_safe(struct mount_info *mi,
+ 		return result;
+ 
+ 	if (!mi->mi_zstd_stream) {
+-		unsigned int workspace_size = ZSTD_DStreamWorkspaceBound(
++		unsigned int workspace_size = zstd_dstream_workspace_bound(
+ 						INCFS_DATA_FILE_BLOCK_SIZE);
+ 		void *workspace = kvmalloc(workspace_size, GFP_NOFS);
+ 		ZSTD_DStream *stream;
+@@ -443,7 +443,7 @@ static ssize_t zstd_decompress_safe(struct mount_info *mi,
+ 			goto out;
+ 		}
+ 
+-		stream = ZSTD_initDStream(INCFS_DATA_FILE_BLOCK_SIZE, workspace,
++		stream = zstd_init_dstream(INCFS_DATA_FILE_BLOCK_SIZE, workspace,
+ 				  workspace_size);
+ 		if (!stream) {
+ 			kvfree(workspace);
+@@ -455,7 +455,7 @@ static ssize_t zstd_decompress_safe(struct mount_info *mi,
+ 		mi->mi_zstd_stream = stream;
+ 	}
+ 
+-	result = ZSTD_decompressStream(mi->mi_zstd_stream, &outbuf, &inbuf) ?
++	result = zstd_decompress_stream(mi->mi_zstd_stream, &outbuf, &inbuf) ?
+ 		-EBADMSG : outbuf.pos;
+ 
+ 	mod_delayed_work(system_wq, &mi->mi_zstd_cleanup_work,

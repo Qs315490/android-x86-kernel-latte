@@ -66,12 +66,14 @@ rm -rf kernels
 GITHUB_URL=https://github.com
 
 declare -A kernel_info=(
+	["5.15,url"]=$GITHUB_URL/android-generic/kernel_common
+	["5.15,branch"]="umbral-20230901"
 	["6.12,url"]=$GITHUB_URL/android-generic/kernel-zenith
 	["6.12,branch"]="6.12"
 	["6.15,url"]=$GITHUB_URL/android-generic/kernel-zenith
 	["6.15,branch"]="6.15"
 )
 
-kernels="${1:-6.12 6.15}"
+kernels="${1:-5.15 6.12 6.15}"
 download_and_patch_kernels
 
