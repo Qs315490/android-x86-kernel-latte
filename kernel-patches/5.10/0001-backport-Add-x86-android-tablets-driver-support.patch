@@ -1,0 +1,1268 @@
+From f9fc8a65bfddea196cc239c7b3fc9f5082443bf4 Mon Sep 17 00:00:00 2001
+From: Qs315490 <qs315490@qq.com>
+Date: Tue, 23 Dec 2025 15:13:59 +0800
+Subject: [PATCH] backport: Add x86-android-tablets driver support for Xiaomi
+ Mi Pad 2
+
+---
+ drivers/platform/x86/Kconfig                  |   2 +
+ drivers/platform/x86/Makefile                 |   1 +
+ drivers/platform/x86/serdev_helpers.h         |  88 +++
+ .../platform/x86/x86-android-tablets/Kconfig  |  26 +
+ .../platform/x86/x86-android-tablets/Makefile |   8 +
+ .../platform/x86/x86-android-tablets/core.c   | 548 ++++++++++++++++++
+ .../platform/x86/x86-android-tablets/dmi.c    |  29 +
+ .../platform/x86/x86-android-tablets/other.c  | 194 +++++++
+ .../x86/x86-android-tablets/shared-psy-info.c | 100 ++++
+ .../x86/x86-android-tablets/shared-psy-info.h |  32 +
+ .../x86-android-tablets/x86-android-tablets.h | 116 ++++
+ 11 files changed, 1144 insertions(+)
+ create mode 100644 drivers/platform/x86/serdev_helpers.h
+ create mode 100644 drivers/platform/x86/x86-android-tablets/Kconfig
+ create mode 100644 drivers/platform/x86/x86-android-tablets/Makefile
+ create mode 100644 drivers/platform/x86/x86-android-tablets/core.c
+ create mode 100644 drivers/platform/x86/x86-android-tablets/dmi.c
+ create mode 100644 drivers/platform/x86/x86-android-tablets/other.c
+ create mode 100644 drivers/platform/x86/x86-android-tablets/shared-psy-info.c
+ create mode 100644 drivers/platform/x86/x86-android-tablets/shared-psy-info.h
+ create mode 100644 drivers/platform/x86/x86-android-tablets/x86-android-tablets.h
+
+diff --git a/drivers/platform/x86/Kconfig b/drivers/platform/x86/Kconfig
+index 0ca5f7f8e..4550d984f 100644
+--- a/drivers/platform/x86/Kconfig
++++ b/drivers/platform/x86/Kconfig
+@@ -1020,6 +1020,8 @@ config INTEL_SCU_IPC_UTIL
+ 	  low level access for debug work and updating the firmware. Say
+ 	  N unless you will be doing this on an Intel MID platform.
+ 
++source "drivers/platform/x86/x86-android-tablets/Kconfig"
++
+ endif # X86_PLATFORM_DEVICES
+ 
+ config PMC_ATOM
+diff --git a/drivers/platform/x86/Makefile b/drivers/platform/x86/Makefile
+index 846cd32cc..5d10330b8 100644
+--- a/drivers/platform/x86/Makefile
++++ b/drivers/platform/x86/Makefile
+@@ -107,6 +107,7 @@ obj-$(CONFIG_I2C_MULTI_INSTANTIATE)	+= i2c-multi-instantiate.o
+ obj-$(CONFIG_I2C_MULTI_INSTANTIATE)	+= i2c-multi-instantiate.o
+ obj-$(CONFIG_MLX_PLATFORM)		+= mlx-platform.o
+ obj-$(CONFIG_TOUCHSCREEN_DMI)		+= touchscreen_dmi.o
++obj-$(CONFIG_X86_ANDROID_TABLETS)	+= x86-android-tablets/
+ 
+ # Intel uncore drivers
+ obj-$(CONFIG_INTEL_IPS)				+= intel_ips.o
+diff --git a/drivers/platform/x86/serdev_helpers.h b/drivers/platform/x86/serdev_helpers.h
+new file mode 100644
+index 000000000..3fb251fc2
+--- /dev/null
++++ b/drivers/platform/x86/serdev_helpers.h
+@@ -0,0 +1,88 @@
++/* SPDX-License-Identifier: GPL-2.0-or-later */
++/*
++ * In some cases UART attached devices which require an in kernel driver,
++ * e.g. UART attached Bluetooth HCIs are described in the ACPI tables
++ * by an ACPI device with a broken or missing UartSerialBusV2() resource.
++ *
++ * This causes the kernel to create a /dev/ttyS# char-device for the UART
++ * instead of creating an in kernel serdev-controller + serdev-device pair
++ * for the in kernel driver.
++ *
++ * The quirk handling in acpi_quirk_skip_serdev_enumeration() makes the kernel
++ * create a serdev-controller device for these UARTs instead of a /dev/ttyS#.
++ *
++ * Instantiating the actual serdev-device to bind to is up to pdx86 code,
++ * this header provides a helper for getting the serdev-controller device.
++ */
++#include <linux/acpi.h>
++#include <linux/device.h>
++#include <linux/err.h>
++#include <linux/printk.h>
++#include <linux/kernel.h>
++#include <linux/string.h>
++
++static inline struct device *
++get_serdev_controller_from_parent(struct device *ctrl_dev,
++				  int serial_ctrl_port,
++				  const char *serdev_ctrl_name)
++{
++	struct device *child;
++	char name[32];
++	int i;
++
++	/* Walk host -> uart-ctrl -> port -> serdev-ctrl */
++	for (i = 0; i < 3; i++) {
++		switch (i) {
++		case 0:
++			snprintf(name, sizeof(name), "%s:0", dev_name(ctrl_dev));
++			break;
++		case 1:
++			snprintf(name, sizeof(name), "%s.%d",
++				 dev_name(ctrl_dev), serial_ctrl_port);
++			break;
++		case 2:
++			strscpy(name, serdev_ctrl_name, sizeof(name));
++			break;
++		}
++
++		child = device_find_child_by_name(ctrl_dev, name);
++		put_device(ctrl_dev);
++		if (!child) {
++			pr_err("error could not find '%s' device\n", name);
++			return ERR_PTR(-ENODEV);
++		}
++
++		ctrl_dev = child;
++	}
++
++	return ctrl_dev;
++}
++
++static inline struct device *
++get_serdev_controller(const char *serial_ctrl_hid,
++		      const char *serial_ctrl_uid,
++		      int serial_ctrl_port,
++		      const char *serdev_ctrl_name)
++{
++	struct acpi_device *adev;
++	struct device *parent;
++
++	adev = acpi_dev_get_first_match_dev(serial_ctrl_hid, serial_ctrl_uid, -1);
++	if (!adev) {
++		pr_err("error could not get %s/%s serial-ctrl adev\n",
++		       serial_ctrl_hid, serial_ctrl_uid ?: "*");
++		return ERR_PTR(-ENODEV);
++	}
++
++	/* get_first_physical_node() returns a weak ref */
++	parent = get_device(acpi_get_first_physical_node(adev));
++	acpi_dev_put(adev);
++	if (!parent) {
++		pr_err("error could not get %s/%s serial-ctrl physical node\n",
++		       serial_ctrl_hid, serial_ctrl_uid ?: "*");
++		return ERR_PTR(-ENODEV);
++	}
++
++	/* This puts our reference on parent and returns a ref on the ctrl */
++	return get_serdev_controller_from_parent(parent, serial_ctrl_port, serdev_ctrl_name);
++}
+diff --git a/drivers/platform/x86/x86-android-tablets/Kconfig b/drivers/platform/x86/x86-android-tablets/Kconfig
+new file mode 100644
+index 000000000..193da15ee
+--- /dev/null
++++ b/drivers/platform/x86/x86-android-tablets/Kconfig
+@@ -0,0 +1,26 @@
++# SPDX-License-Identifier: GPL-2.0-or-later
++#
++# X86 Android tablet support Kconfig
++#
++
++config X86_ANDROID_TABLETS
++	tristate "X86 Android tablet support"
++	depends on I2C && SPI && SERIAL_DEV_BUS
++	depends on GPIOLIB && PMIC_OPREGION
++	depends on ACPI && EFI && PCI
++	select NEW_LEDS
++	select LEDS_CLASS
++	select POWER_SUPPLY
++	help
++	  X86 tablets which ship with Android as (part of) the factory image
++	  typically have various problems with their DSDTs. The factory kernels
++	  shipped on these devices typically have device addresses and GPIOs
++	  hardcoded in the kernel, rather than specified in their DSDT.
++
++	  With the DSDT containing a random collection of devices which may or
++	  may not actually be present. This driver contains various fixes for
++	  such tablets, including instantiating kernel devices for devices which
++	  are missing from the DSDT.
++
++	  If you have a x86 Android tablet say Y or M here, for a generic x86
++	  distro configuration say M here.
+diff --git a/drivers/platform/x86/x86-android-tablets/Makefile b/drivers/platform/x86/x86-android-tablets/Makefile
+new file mode 100644
+index 000000000..810e43fa8
+--- /dev/null
++++ b/drivers/platform/x86/x86-android-tablets/Makefile
+@@ -0,0 +1,8 @@
++# SPDX-License-Identifier: GPL-2.0-or-later
++#
++# X86 Android tablet support Makefile
++#
++
++obj-$(CONFIG_X86_ANDROID_TABLETS) += x86-android-tablets.o
++x86-android-tablets-y := core.o dmi.o shared-psy-info.o \
++			 other.o
+diff --git a/drivers/platform/x86/x86-android-tablets/core.c b/drivers/platform/x86/x86-android-tablets/core.c
+new file mode 100644
+index 000000000..2faa47a55
+--- /dev/null
++++ b/drivers/platform/x86/x86-android-tablets/core.c
+@@ -0,0 +1,553 @@
++// SPDX-License-Identifier: GPL-2.0-or-later
++/*
++ * DMI based code to deal with broken DSDTs on X86 tablets which ship with
++ * Android as (part of) the factory image. The factory kernels shipped on these
++ * devices typically have a bunch of things hardcoded, rather than specified
++ * in their DSDT.
++ *
++ * Copyright (C) 2021-2023 Hans de Goede <hdegoede@redhat.com>
++ */
++
++#define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
++
++#include <linux/acpi.h>
++#include <linux/device.h>
++#include <linux/dmi.h>
++#include <linux/gpio/consumer.h>
++#include <linux/gpio/machine.h>
++#include <linux/irq.h>
++#include <linux/module.h>
++#include <linux/pci.h>
++#include <linux/platform_device.h>
++#include <linux/serdev.h>
++#include <linux/string.h>
++
++#include "x86-android-tablets.h"
++#include "../serdev_helpers.h"
++
++static struct platform_device *x86_android_tablet_device;
++
++/*
++ * This helper allows getting a GPIO descriptor *before* the actual device
++ * consuming it has been instantiated. This function MUST only be used to
++ * handle this special case such as, e.g.:
++ *
++ * 1. Getting an IRQ from a GPIO for i2c_board_info.irq which is passed to
++ * i2c_client_new() to instantiate i2c_client-s; or
++ * 2. Calling desc_to_gpio() to get an old style GPIO number for gpio-keys
++ * platform_data which still uses old style GPIO numbers.
++ *
++ * Since the consuming device has not been instantiated yet a dynamic lookup
++ * is generated using the special x86_android_tablet device for dev_id.
++ *
++ * For normal GPIO lookups a standard static struct gpiod_lookup_table MUST be used.
++ */
++int x86_android_tablet_get_gpiod(const char *chip, int pin, const char *con_id,
++				 bool active_low, enum gpiod_flags dflags,
++				 struct gpio_desc **desc)
++{
++	struct gpiod_lookup_table *lookup;
++	struct gpio_desc *gpiod;
++
++	lookup = kzalloc(struct_size(lookup, table, 2), GFP_KERNEL);
++	if (!lookup)
++		return -ENOMEM;
++
++	lookup->dev_id = KBUILD_MODNAME;
++	lookup->table[0] = (struct gpiod_lookup) {
++		.key = chip,
++		.chip_hwnum = pin,
++		.con_id = con_id,
++		.idx = 0,
++		.flags = active_low ? GPIO_ACTIVE_LOW : GPIO_ACTIVE_HIGH,
++	};
++
++	gpiod_add_lookup_table(lookup);
++	gpiod = devm_gpiod_get(&x86_android_tablet_device->dev, con_id, dflags);
++	gpiod_remove_lookup_table(lookup);
++	kfree(lookup);
++
++	if (IS_ERR(gpiod)) {
++		pr_err("error %ld getting GPIO %s %d\n", PTR_ERR(gpiod), chip, pin);
++		return PTR_ERR(gpiod);
++	}
++
++	if (desc)
++		*desc = gpiod;
++
++	return 0;
++}
++
++int x86_acpi_irq_helper_get(const struct x86_acpi_irq_data *data)
++{
++	struct irq_fwspec fwspec = { };
++	struct irq_domain *domain;
++	struct acpi_device *adev;
++	struct gpio_desc *gpiod;
++	unsigned int irq_type;
++	acpi_handle handle;
++	acpi_status status;
++	int irq, ret;
++
++	switch (data->type) {
++	case X86_ACPI_IRQ_TYPE_APIC:
++		/*
++		 * The DSDT may already reference the GSI in a device skipped by
++		 * acpi_quirk_skip_i2c_client_enumeration(). Unregister the GSI
++		 * to avoid -EBUSY errors in this case.
++		 */
++		acpi_unregister_gsi(data->index);
++		irq = acpi_register_gsi(NULL, data->index, data->trigger, data->polarity);
++		if (irq < 0)
++			pr_err("error %d getting APIC IRQ %d\n", irq, data->index);
++
++		return irq;
++	case X86_ACPI_IRQ_TYPE_GPIOINT:
++		/* Like acpi_dev_gpio_irq_get(), but without parsing ACPI resources */
++		ret = x86_android_tablet_get_gpiod(data->chip, data->index, data->con_id,
++						   false, GPIOD_ASIS, &gpiod);
++		if (ret)
++			return ret;
++
++		irq = gpiod_to_irq(gpiod);
++		if (irq < 0) {
++			pr_err("error %d getting IRQ %s %d\n", irq, data->chip, data->index);
++			return irq;
++		}
++
++		irq_type = acpi_dev_get_irq_type(data->trigger, data->polarity);
++		if (irq_type != IRQ_TYPE_NONE && irq_type != irq_get_trigger_type(irq))
++			irq_set_irq_type(irq, irq_type);
++
++		if (data->free_gpio)
++			devm_gpiod_put(&x86_android_tablet_device->dev, gpiod);
++
++		return irq;
++	case X86_ACPI_IRQ_TYPE_PMIC:
++		status = acpi_get_handle(NULL, data->chip, &handle);
++		if (ACPI_FAILURE(status)) {
++			pr_err("error could not get %s handle\n", data->chip);
++			return -ENODEV;
++		}
++
++		status = acpi_bus_get_device(handle, &adev);
++		if (ACPI_FAILURE(status) || !adev) {
++			pr_err("error could not get %s adev\n", data->chip);
++			return -ENODEV;
++		}
++
++		fwspec.fwnode = acpi_fwnode_handle(adev);
++		domain = irq_find_matching_fwspec(&fwspec, data->domain);
++		if (!domain) {
++			pr_err("error could not find IRQ domain for %s\n", data->chip);
++			return -ENODEV;
++		}
++
++		return irq_create_mapping(domain, data->index);
++	default:
++		return 0;
++	}
++}
++
++static int i2c_client_count;
++static int spi_dev_count;
++static int pdev_count;
++static int serdev_count;
++static struct i2c_client **i2c_clients;
++static struct spi_device **spi_devs;
++static struct platform_device **pdevs;
++static struct serdev_device **serdevs;
++static struct gpio_keys_button *buttons;
++static struct gpiod_lookup_table * const *gpiod_lookup_tables;
++static const struct software_node *bat_swnode;
++static void (*exit_handler)(void);
++
++static __init struct i2c_adapter *
++get_i2c_adap_by_handle(const struct x86_i2c_client_info *client_info)
++{
++	acpi_handle handle;
++	acpi_status status;
++
++	status = acpi_get_handle(NULL, client_info->adapter_path, &handle);
++	if (ACPI_FAILURE(status)) {
++		pr_err("Error could not get %s handle\n", client_info->adapter_path);
++		return NULL;
++	}
++
++	return i2c_acpi_find_adapter_by_handle(handle);
++}
++
++static __init int match_parent(struct device *dev, const void *data)
++{
++	return dev->parent == data;
++}
++
++static __init struct i2c_adapter *
++get_i2c_adap_by_pci_parent(const struct x86_i2c_client_info *client_info)
++{
++	struct i2c_adapter *adap = NULL;
++	struct device *pdev, *adap_dev;
++
++	pdev = bus_find_device_by_name(&pci_bus_type, NULL, client_info->adapter_path);
++	if (!pdev) {
++		pr_err("Error could not find %s PCI device\n", client_info->adapter_path);
++		return NULL;
++	}
++
++	adap_dev = bus_find_device(&i2c_bus_type, NULL, pdev, match_parent);
++	if (adap_dev) {
++		adap = i2c_verify_adapter(adap_dev);
++		if (!adap)
++			put_device(adap_dev);
++	}
++
++	put_device(pdev);
++
++	return adap;
++}
++
++static __init int x86_instantiate_i2c_client(const struct x86_dev_info *dev_info,
++					     int idx)
++{
++	const struct x86_i2c_client_info *client_info = &dev_info->i2c_client_info[idx];
++	struct i2c_board_info board_info = client_info->board_info;
++	struct i2c_adapter *adap;
++
++	board_info.irq = x86_acpi_irq_helper_get(&client_info->irq_data);
++	if (board_info.irq < 0)
++		return board_info.irq;
++
++	if (dev_info->use_pci)
++		adap = get_i2c_adap_by_pci_parent(client_info);
++	else
++		adap = get_i2c_adap_by_handle(client_info);
++
++	if (!adap) {
++		pr_err("error could not get %s adapter\n", client_info->adapter_path);
++		return -ENODEV;
++	}
++
++	i2c_clients[idx] = i2c_new_client_device(adap, &board_info);
++	put_device(&adap->dev);
++	if (IS_ERR(i2c_clients[idx]))
++		return dev_err_probe(&adap->dev, PTR_ERR(i2c_clients[idx]),
++				      "creating I2C-client %d\n", idx);
++
++	return 0;
++}
++
++static __init int x86_instantiate_spi_dev(const struct x86_dev_info *dev_info, int idx)
++{
++	const struct x86_spi_dev_info *spi_dev_info = &dev_info->spi_dev_info[idx];
++	struct spi_board_info board_info = spi_dev_info->board_info;
++	struct spi_controller *controller;
++	struct device *ctrl_dev;
++	struct acpi_device *adev;
++	acpi_handle handle;
++	acpi_status status;
++
++	board_info.irq = x86_acpi_irq_helper_get(&spi_dev_info->irq_data);
++	if (board_info.irq < 0)
++		return board_info.irq;
++
++	status = acpi_get_handle(NULL, spi_dev_info->ctrl_path, &handle);
++	if (ACPI_FAILURE(status)) {
++		pr_err("Error could not get %s handle\n", spi_dev_info->ctrl_path);
++		return -ENODEV;
++	}
++
++	status = acpi_bus_get_device(handle, &adev);
++	if (ACPI_FAILURE(status) || !adev) {
++		pr_err("Error could not get adev for %s\n", spi_dev_info->ctrl_path);
++		return -ENODEV;
++	}
++
++	ctrl_dev = bus_find_device_by_acpi_dev(&spi_bus_type, adev);
++	if (!ctrl_dev)
++		return -ENODEV;
++
++	controller = (struct spi_controller *)dev_get_drvdata(ctrl_dev);
++	if (!controller) {
++		pr_err("Error could not get SPI controller for %s\n", spi_dev_info->ctrl_path);
++		return -ENODEV;
++	}
++
++	spi_devs[idx] = spi_new_device(controller, &board_info);
++	put_device(&controller->dev);
++	if (!spi_devs[idx])
++		return dev_err_probe(&controller->dev, -ENOMEM,
++				     "creating SPI-device %d\n", idx);
++
++	return 0;
++}
++
++static __init struct device *
++get_serdev_controller_by_pci_parent(const struct x86_serdev_info *info)
++{
++	struct pci_dev *pdev;
++
++	pdev = pci_get_domain_bus_and_slot(0, 0, info->ctrl.pci.devfn);
++	if (!pdev)
++		return ERR_PTR(-EPROBE_DEFER);
++
++	/* This puts our reference on pdev and returns a ref on the ctrl */
++	return get_serdev_controller_from_parent(&pdev->dev, 0, info->ctrl_devname);
++}
++
++static __init int x86_instantiate_serdev(const struct x86_dev_info *dev_info, int idx)
++{
++	const struct x86_serdev_info *info = &dev_info->serdev_info[idx];
++	struct acpi_device *serdev_adev;
++	struct serdev_device *serdev;
++	struct device *ctrl_dev;
++	int ret = -ENODEV;
++
++	if (dev_info->use_pci)
++		ctrl_dev = get_serdev_controller_by_pci_parent(info);
++	else
++		ctrl_dev = get_serdev_controller(info->ctrl.acpi.hid, info->ctrl.acpi.uid,
++						 0, info->ctrl_devname);
++	if (IS_ERR(ctrl_dev))
++		return PTR_ERR(ctrl_dev);
++
++	serdev_adev = acpi_dev_get_first_match_dev(info->serdev_hid, NULL, -1);
++	if (!serdev_adev) {
++		pr_err("error could not get %s serdev adev\n", info->serdev_hid);
++		goto put_ctrl_dev;
++	}
++
++	serdev = serdev_device_alloc(to_serdev_controller(ctrl_dev));
++	if (!serdev) {
++		ret = -ENOMEM;
++		goto put_serdev_adev;
++	}
++
++	ACPI_COMPANION_SET(&serdev->dev, serdev_adev);
++	acpi_device_set_enumerated(serdev_adev);
++
++	ret = serdev_device_add(serdev);
++	if (ret) {
++		dev_err(&serdev->dev, "error %d adding serdev\n", ret);
++		serdev_device_put(serdev);
++		goto put_serdev_adev;
++	}
++
++	serdevs[idx] = serdev;
++
++put_serdev_adev:
++	acpi_dev_put(serdev_adev);
++put_ctrl_dev:
++	put_device(ctrl_dev);
++	return ret;
++}
++
++static int x86_android_tablet_remove(struct platform_device *pdev)
++{
++	int i;
++
++	for (i = serdev_count - 1; i >= 0; i--) {
++		if (serdevs[i])
++			serdev_device_remove(serdevs[i]);
++	}
++
++	kfree(serdevs);
++
++	for (i = pdev_count - 1; i >= 0; i--)
++		platform_device_unregister(pdevs[i]);
++
++	kfree(pdevs);
++	kfree(buttons);
++
++	for (i = spi_dev_count - 1; i >= 0; i--)
++		spi_unregister_device(spi_devs[i]);
++
++	kfree(spi_devs);
++
++	for (i = i2c_client_count - 1; i >= 0; i--)
++		i2c_unregister_device(i2c_clients[i]);
++
++	kfree(i2c_clients);
++
++	if (exit_handler)
++		exit_handler();
++
++	for (i = 0; gpiod_lookup_tables && gpiod_lookup_tables[i]; i++)
++		gpiod_remove_lookup_table(gpiod_lookup_tables[i]);
++
++	software_node_unregister(bat_swnode);
++	return 0;
++}
++
++static __init int x86_android_tablet_probe(struct platform_device *pdev)
++{
++	const struct x86_dev_info *dev_info;
++	const struct dmi_system_id *id;
++	int i, ret = 0;
++
++	id = dmi_first_match(x86_android_tablet_ids);
++	if (!id)
++		return -ENODEV;
++
++	dev_info = id->driver_data;
++	/* Allow x86_android_tablet_device use before probe() exits */
++	x86_android_tablet_device = pdev;
++
++	/*
++	 * Since this runs from module_init() it cannot use -EPROBE_DEFER,
++	 * instead pre-load any modules which are listed as requirements.
++	 */
++	for (i = 0; dev_info->modules && dev_info->modules[i]; i++)
++		request_module(dev_info->modules[i]);
++
++	bat_swnode = dev_info->bat_swnode;
++	if (bat_swnode) {
++		ret = software_node_register(bat_swnode);
++		if (ret)
++			return ret;
++	}
++
++	gpiod_lookup_tables = dev_info->gpiod_lookup_tables;
++	for (i = 0; gpiod_lookup_tables && gpiod_lookup_tables[i]; i++)
++		gpiod_add_lookup_table(gpiod_lookup_tables[i]);
++
++	if (dev_info->init) {
++		ret = dev_info->init(&pdev->dev);
++		if (ret < 0) {
++			x86_android_tablet_remove(pdev);
++			return ret;
++		}
++		exit_handler = dev_info->exit;
++	}
++
++	i2c_clients = kcalloc(dev_info->i2c_client_count, sizeof(*i2c_clients), GFP_KERNEL);
++	if (!i2c_clients) {
++		x86_android_tablet_remove(pdev);
++		return -ENOMEM;
++	}
++
++	i2c_client_count = dev_info->i2c_client_count;
++	for (i = 0; i < i2c_client_count; i++) {
++		ret = x86_instantiate_i2c_client(dev_info, i);
++		if (ret < 0) {
++			x86_android_tablet_remove(pdev);
++			return ret;
++		}
++	}
++
++	spi_devs = kcalloc(dev_info->spi_dev_count, sizeof(*spi_devs), GFP_KERNEL);
++	if (!spi_devs) {
++		x86_android_tablet_remove(pdev);
++		return -ENOMEM;
++	}
++
++	spi_dev_count = dev_info->spi_dev_count;
++	for (i = 0; i < spi_dev_count; i++) {
++		ret = x86_instantiate_spi_dev(dev_info, i);
++		if (ret < 0) {
++			x86_android_tablet_remove(pdev);
++			return ret;
++		}
++	}
++
++	/* + 1 to make space for the (optional) gpio_keys_button platform device */
++	pdevs = kcalloc(dev_info->pdev_count + 1, sizeof(*pdevs), GFP_KERNEL);
++	if (!pdevs) {
++		x86_android_tablet_remove(pdev);
++		return -ENOMEM;
++	}
++
++	pdev_count = dev_info->pdev_count;
++	for (i = 0; i < pdev_count; i++) {
++		pdevs[i] = platform_device_register_full(&dev_info->pdev_info[i]);
++		if (IS_ERR(pdevs[i])) {
++			ret = PTR_ERR(pdevs[i]);
++			x86_android_tablet_remove(pdev);
++			return ret;
++		}
++	}
++
++	serdevs = kcalloc(dev_info->serdev_count, sizeof(*serdevs), GFP_KERNEL);
++	if (!serdevs) {
++		x86_android_tablet_remove(pdev);
++		return -ENOMEM;
++	}
++
++	serdev_count = dev_info->serdev_count;
++	for (i = 0; i < serdev_count; i++) {
++		ret = x86_instantiate_serdev(dev_info, i);
++		if (ret < 0) {
++			x86_android_tablet_remove(pdev);
++			return ret;
++		}
++	}
++
++	if (dev_info->gpio_button_count) {
++		struct gpio_keys_platform_data pdata = { };
++		struct gpio_desc *gpiod;
++
++		buttons = kcalloc(dev_info->gpio_button_count, sizeof(*buttons), GFP_KERNEL);
++		if (!buttons) {
++			x86_android_tablet_remove(pdev);
++			return -ENOMEM;
++		}
++
++		for (i = 0; i < dev_info->gpio_button_count; i++) {
++			ret = x86_android_tablet_get_gpiod(dev_info->gpio_button[i].chip,
++							   dev_info->gpio_button[i].pin,
++							   dev_info->gpio_button[i].button.desc,
++							   false, GPIOD_IN, &gpiod);
++			if (ret < 0) {
++				x86_android_tablet_remove(pdev);
++				return ret;
++			}
++
++			buttons[i] = dev_info->gpio_button[i].button;
++			buttons[i].gpio = desc_to_gpio(gpiod);
++			/* Release GPIO descriptor so that gpio-keys can request it */
++			devm_gpiod_put(&x86_android_tablet_device->dev, gpiod);
++		}
++
++		pdata.buttons = buttons;
++		pdata.nbuttons = dev_info->gpio_button_count;
++
++		pdevs[pdev_count] = platform_device_register_data(&pdev->dev, "gpio-keys",
++								  PLATFORM_DEVID_AUTO,
++								  &pdata, sizeof(pdata));
++		if (IS_ERR(pdevs[pdev_count])) {
++			ret = PTR_ERR(pdevs[pdev_count]);
++			x86_android_tablet_remove(pdev);
++			return ret;
++		}
++		pdev_count++;
++	}
++
++	return 0;
++}
++
++static struct platform_driver x86_android_tablet_driver = {
++	.driver = {
++		.name = KBUILD_MODNAME,
++	},
++	.remove = x86_android_tablet_remove,
++};
++
++static int __init x86_android_tablet_init(void)
++{
++	x86_android_tablet_device = platform_create_bundle(&x86_android_tablet_driver,
++						   x86_android_tablet_probe,
++						   NULL, 0, NULL, 0);
++
++	return PTR_ERR_OR_ZERO(x86_android_tablet_device);
++}
++module_init(x86_android_tablet_init);
++
++static void __exit x86_android_tablet_exit(void)
++{
++	platform_device_unregister(x86_android_tablet_device);
++	platform_driver_unregister(&x86_android_tablet_driver);
++}
++module_exit(x86_android_tablet_exit);
++
++MODULE_AUTHOR("Hans de Goede <hdegoede@redhat.com>");
++MODULE_DESCRIPTION("X86 Android tablets DSDT fixups driver");
++MODULE_LICENSE("GPL");
+diff --git a/drivers/platform/x86/x86-android-tablets/dmi.c b/drivers/platform/x86/x86-android-tablets/dmi.c
+new file mode 100644
+index 000000000..0992a9208
+--- /dev/null
++++ b/drivers/platform/x86/x86-android-tablets/dmi.c
+@@ -0,0 +1,29 @@
++// SPDX-License-Identifier: GPL-2.0-or-later
++/*
++ * DMI based code to deal with broken DSDTs on X86 tablets which ship with
++ * Android as (part of) the factory image. The factory kernels shipped on these
++ * devices typically have a bunch of things hardcoded, rather than specified
++ * in their DSDT.
++ *
++ * Copyright (C) 2021-2023 Hans de Goede <hdegoede@redhat.com>
++ */
++
++#include <linux/dmi.h>
++#include <linux/init.h>
++#include <linux/mod_devicetable.h>
++#include <linux/module.h>
++
++#include "x86-android-tablets.h"
++
++const struct dmi_system_id x86_android_tablet_ids[] __initconst = {
++	{
++		/* Xiaomi Mi Pad 2 */
++		.matches = {
++			DMI_MATCH(DMI_SYS_VENDOR, "Xiaomi Inc"),
++			DMI_MATCH(DMI_PRODUCT_NAME, "Mipad2"),
++		},
++		.driver_data = (void *)&xiaomi_mipad2_info,
++	},
++	{ }
++};
++MODULE_DEVICE_TABLE(dmi, x86_android_tablet_ids);
+diff --git a/drivers/platform/x86/x86-android-tablets/other.c b/drivers/platform/x86/x86-android-tablets/other.c
+new file mode 100644
+index 000000000..4b0710a77
+--- /dev/null
++++ b/drivers/platform/x86/x86-android-tablets/other.c
+@@ -0,0 +1,194 @@
++// SPDX-License-Identifier: GPL-2.0-or-later
++/*
++ * DMI based code to deal with broken DSDTs on X86 tablets which ship with
++ * Android as (part of) the factory image. The factory kernels shipped on these
++ * devices typically have a bunch of things hardcoded, rather than specified
++ * in their DSDT.
++ *
++ * Copyright (C) 2021-2023 Hans de Goede <hdegoede@redhat.com>
++ */
++
++#include <linux/acpi.h>
++#include <linux/gpio/machine.h>
++#include <linux/input.h>
++#include <linux/leds.h>
++#include <linux/pci.h>
++#include <linux/platform_device.h>
++#include <linux/pwm.h>
++
++#include <dt-bindings/leds/common.h>
++
++#include "shared-psy-info.h"
++#include "x86-android-tablets.h"
++
++/*
++ * The firmware node for ktd2026 on Xaomi pad2. It composed of a RGB LED node
++ * with three subnodes for each color (B/G/R). The RGB LED node is named
++ * "multi-led" to align with the name in the device tree.
++ */
++
++/* Main firmware node for ktd2026 */
++static const struct software_node ktd2026_node = {
++	.name = "ktd2026",
++};
++
++static const struct property_entry ktd2026_rgb_led_props[] = {
++	PROPERTY_ENTRY_U32("reg", 0),
++	PROPERTY_ENTRY_U32("color", LED_COLOR_ID_RGB),
++	PROPERTY_ENTRY_STRING("label", "mipad2:rgb:indicator"),
++	PROPERTY_ENTRY_STRING("linux,default-trigger", "bq27520-0-charging-orange-full-green"),
++	{ }
++};
++
++static const struct software_node ktd2026_rgb_led_node = {
++	.name = "multi-led",
++	.properties = ktd2026_rgb_led_props,
++	.parent = &ktd2026_node,
++};
++
++static const struct property_entry ktd2026_blue_led_props[] = {
++	PROPERTY_ENTRY_U32("reg", 0),
++	PROPERTY_ENTRY_U32("color", LED_COLOR_ID_BLUE),
++	{ }
++};
++
++static const struct software_node ktd2026_blue_led_node = {
++	.properties = ktd2026_blue_led_props,
++	.parent = &ktd2026_rgb_led_node,
++};
++
++static const struct property_entry ktd2026_green_led_props[] = {
++	PROPERTY_ENTRY_U32("reg", 1),
++	PROPERTY_ENTRY_U32("color", LED_COLOR_ID_GREEN),
++	{ }
++};
++
++static const struct software_node ktd2026_green_led_node = {
++	.properties = ktd2026_green_led_props,
++	.parent = &ktd2026_rgb_led_node,
++};
++
++static const struct property_entry ktd2026_red_led_props[] = {
++	PROPERTY_ENTRY_U32("reg", 2),
++	PROPERTY_ENTRY_U32("color", LED_COLOR_ID_RED),
++	{ }
++};
++
++static const struct software_node ktd2026_red_led_node = {
++	.properties = ktd2026_red_led_props,
++	.parent = &ktd2026_rgb_led_node,
++};
++
++static const struct software_node *ktd2026_node_group[] = {
++	&ktd2026_node,
++	&ktd2026_rgb_led_node,
++	&ktd2026_red_led_node,
++	&ktd2026_green_led_node,
++	&ktd2026_blue_led_node,
++	NULL
++};
++
++/*
++ * For the LEDs which backlight the Menu / Home / Back capacitive buttons on
++ * the bottom bezel. These are attached to a TPS61158 LED controller which
++ * is controlled by the "pwm_soc_lpss_2" PWM output.
++ */
++#define XIAOMI_MIPAD2_LED_PERIOD_NS		19200
++#define XIAOMI_MIPAD2_LED_MAX_DUTY_NS		 6000 /* From Android kernel */
++
++static struct pwm_device *xiaomi_mipad2_led_pwm;
++
++static int xiaomi_mipad2_brightness_set(struct led_classdev *led_cdev,
++					enum led_brightness val)
++{
++	int duty_ns;
++
++	/* 计算占空比 */
++	duty_ns = XIAOMI_MIPAD2_LED_MAX_DUTY_NS * val / LED_FULL;
++
++	/* 配置 PWM：duty_cycle 和 period */
++	if (pwm_config(xiaomi_mipad2_led_pwm,
++		       duty_ns,
++		       XIAOMI_MIPAD2_LED_PERIOD_NS)) {
++		dev_err(led_cdev->dev, "failed to configure PWM\n");
++		return -EIO;
++	}
++
++	/* 启用 PWM（避免引脚悬空） */
++	if (val == LED_OFF) {
++		/* 如果亮度为 0，是否要关闭 PWM？根据硬件决定 */
++		/* 但注释说“Always set PWM enabled to avoid the pin floating”，所以即使 0 也保持 enable */
++		/* 但 duty_cycle=0 时，输出为低，通常安全 */
++		return pwm_enable(xiaomi_mipad2_led_pwm);
++	} else {
++		return pwm_enable(xiaomi_mipad2_led_pwm);
++	}
++}
++
++static int __init xiaomi_mipad2_init(struct device *dev)
++{
++	struct led_classdev *led_cdev;
++	int ret;
++
++	xiaomi_mipad2_led_pwm = devm_pwm_get(dev, "pwm_soc_lpss_2");
++	if (IS_ERR(xiaomi_mipad2_led_pwm))
++		return dev_err_probe(dev, PTR_ERR(xiaomi_mipad2_led_pwm), "getting pwm\n");
++
++	led_cdev = devm_kzalloc(dev, sizeof(*led_cdev), GFP_KERNEL);
++	if (!led_cdev)
++		return -ENOMEM;
++
++	led_cdev->name = "mipad2:white:touch-buttons-backlight";
++	led_cdev->max_brightness = LED_FULL;
++	led_cdev->default_trigger = "input-events";
++	led_cdev->brightness_set_blocking = xiaomi_mipad2_brightness_set;
++	/* Turn LED off during suspend */
++	led_cdev->flags = LED_CORE_SUSPENDRESUME;
++
++	ret = devm_led_classdev_register(dev, led_cdev);
++	if (ret)
++		return dev_err_probe(dev, ret, "registering LED\n");
++
++	return software_node_register_node_group(ktd2026_node_group);
++}
++
++static void xiaomi_mipad2_exit(void)
++{
++	software_node_unregister_node_group(ktd2026_node_group);
++}
++
++/*
++ * If the EFI bootloader is not Xiaomi's own signed Android loader, then the
++ * Xiaomi Mi Pad 2 X86 tablet sets OSID in the DSDT to 1 (Windows), causing
++ * a bunch of devices to be hidden.
++ *
++ * This takes care of instantiating the hidden devices manually.
++ */
++static const struct x86_i2c_client_info xiaomi_mipad2_i2c_clients[] __initconst = {
++	{
++		/* BQ27520 fuel-gauge */
++		.board_info = {
++			.type = "bq27520",
++			.addr = 0x55,
++			.dev_name = "bq27520",
++			.swnode = &fg_bq25890_supply_node,
++		},
++		.adapter_path = "\\_SB_.PCI0.I2C1",
++	}, {
++		/* KTD2026 RGB notification LED controller */
++		.board_info = {
++			.type = "ktd2026",
++			.addr = 0x30,
++			.dev_name = "ktd2026",
++			.swnode = &ktd2026_node,
++		},
++		.adapter_path = "\\_SB_.PCI0.I2C3",
++	},
++};
++
++const struct x86_dev_info xiaomi_mipad2_info __initconst = {
++	.i2c_client_info = xiaomi_mipad2_i2c_clients,
++	.i2c_client_count = ARRAY_SIZE(xiaomi_mipad2_i2c_clients),
++	.init = xiaomi_mipad2_init,
++	.exit = xiaomi_mipad2_exit,
++};
+diff --git a/drivers/platform/x86/x86-android-tablets/shared-psy-info.c b/drivers/platform/x86/x86-android-tablets/shared-psy-info.c
+new file mode 100644
+index 000000000..a46fa15ac
+--- /dev/null
++++ b/drivers/platform/x86/x86-android-tablets/shared-psy-info.c
+@@ -0,0 +1,100 @@
++// SPDX-License-Identifier: GPL-2.0-or-later
++/*
++ * Shared psy info for X86 tablets which ship with Android as the factory image
++ * and which have broken DSDT tables. The factory kernels shipped on these
++ * devices typically have a bunch of things hardcoded, rather than specified
++ * in their DSDT.
++ *
++ * Copyright (C) 2021-2023 Hans de Goede <hdegoede@redhat.com>
++ */
++
++#include <linux/gpio/machine.h>
++#include <linux/platform_device.h>
++#include <linux/power/bq24190_charger.h>
++#include <linux/property.h>
++#include <linux/regulator/machine.h>
++
++#include "shared-psy-info.h"
++
++/* Generic / shared charger / battery settings */
++const char * const tusb1211_chg_det_psy[] = { "tusb1211-charger-detect" };
++const char * const bq24190_psy[] = { "bq24190-charger" };
++const char * const bq25890_psy[] = { "bq25890-charger-0" };
++
++static const struct property_entry fg_bq24190_supply_props[] = {
++	PROPERTY_ENTRY_STRING_ARRAY("supplied-from", bq24190_psy),
++	{ }
++};
++
++const struct software_node fg_bq24190_supply_node = {
++	.properties = fg_bq24190_supply_props,
++};
++
++static const struct property_entry fg_bq25890_supply_props[] = {
++	PROPERTY_ENTRY_STRING_ARRAY("supplied-from", bq25890_psy),
++	{ }
++};
++
++const struct software_node fg_bq25890_supply_node = {
++	.properties = fg_bq25890_supply_props,
++};
++
++/* LiPo HighVoltage (max 4.35V) settings used by most devs with a HV battery */
++static const struct property_entry generic_lipo_hv_4v35_battery_props[] = {
++	PROPERTY_ENTRY_STRING("compatible", "simple-battery"),
++	PROPERTY_ENTRY_STRING("device-chemistry", "lithium-ion"),
++	PROPERTY_ENTRY_U32("precharge-current-microamp", 256000),
++	PROPERTY_ENTRY_U32("charge-term-current-microamp", 128000),
++	PROPERTY_ENTRY_U32("constant-charge-current-max-microamp", 1856000),
++	PROPERTY_ENTRY_U32("constant-charge-voltage-max-microvolt", 4352000),
++	PROPERTY_ENTRY_U32("factory-internal-resistance-micro-ohms", 150000),
++	{ }
++};
++
++const struct software_node generic_lipo_hv_4v35_battery_node = {
++	.properties = generic_lipo_hv_4v35_battery_props,
++};
++
++/* For enabling the bq24190 5V boost based on id-pin */
++static struct regulator_consumer_supply intel_int3496_consumer = {
++	.supply = "vbus",
++	.dev_name = "intel-int3496",
++};
++
++static const struct regulator_init_data bq24190_vbus_init_data = {
++	.constraints = {
++		.name = "bq24190_vbus",
++		.valid_ops_mask = REGULATOR_CHANGE_STATUS,
++	},
++	.consumer_supplies = &intel_int3496_consumer,
++	.num_consumer_supplies = 1,
++};
++
++struct bq24190_platform_data bq24190_pdata = {
++	.regulator_init_data = &bq24190_vbus_init_data,
++};
++
++const char * const bq24190_modules[] __initconst = {
++	"intel_crystal_cove_charger", /* For the bq24190 IRQ */
++	"bq24190_charger",            /* For the Vbus regulator for intel-int3496 */
++	NULL
++};
++
++/* Generic platform device array and GPIO lookup table for micro USB ID pin handling */
++const struct platform_device_info int3496_pdevs[] __initconst = {
++	{
++		/* For micro USB ID pin handling */
++		.name = "intel-int3496",
++		.id = PLATFORM_DEVID_NONE,
++	},
++};
++
++struct gpiod_lookup_table int3496_reference_gpios = {
++	.dev_id = "intel-int3496",
++	.table = {
++		GPIO_LOOKUP("INT33FC:01", 15, "vbus", GPIO_ACTIVE_HIGH),
++		GPIO_LOOKUP("INT33FC:02", 1, "mux", GPIO_ACTIVE_HIGH),
++		GPIO_LOOKUP("INT33FC:02", 18, "id", GPIO_ACTIVE_HIGH),
++		{ }
++	},
++};
+diff --git a/drivers/platform/x86/x86-android-tablets/shared-psy-info.h b/drivers/platform/x86/x86-android-tablets/shared-psy-info.h
+new file mode 100644
+index 000000000..c2d2968cd
+--- /dev/null
++++ b/drivers/platform/x86/x86-android-tablets/shared-psy-info.h
+@@ -0,0 +1,32 @@
++/* SPDX-License-Identifier: GPL-2.0-or-later
++ *
++ * Shared psy info for X86 tablets which ship with Android as the factory image
++ * and which have broken DSDT tables. The factory kernels shipped on these
++ * devices typically have a bunch of things hardcoded, rather than specified
++ * in their DSDT.
++ *
++ * Copyright (C) 2021-2023 Hans de Goede <hdegoede@redhat.com>
++ */
++#ifndef __PDX86_SHARED_PSY_INFO_H
++#define __PDX86_SHARED_PSY_INFO_H
++
++struct bq24190_platform_data;
++struct gpiod_lookup_table;
++struct platform_device_info;
++struct software_node;
++
++extern const char * const tusb1211_chg_det_psy[];
++extern const char * const bq24190_psy[];
++extern const char * const bq25890_psy[];
++
++extern const struct software_node fg_bq24190_supply_node;
++extern const struct software_node fg_bq25890_supply_node;
++extern const struct software_node generic_lipo_hv_4v35_battery_node;
++
++extern struct bq24190_platform_data bq24190_pdata;
++extern const char * const bq24190_modules[];
++
++extern const struct platform_device_info int3496_pdevs[];
++extern struct gpiod_lookup_table int3496_reference_gpios;
++
++#endif
+diff --git a/drivers/platform/x86/x86-android-tablets/x86-android-tablets.h b/drivers/platform/x86/x86-android-tablets/x86-android-tablets.h
+new file mode 100644
+index 000000000..cba7c04bc
+--- /dev/null
++++ b/drivers/platform/x86/x86-android-tablets/x86-android-tablets.h
+@@ -0,0 +1,116 @@
++/* SPDX-License-Identifier: GPL-2.0-or-later
++ *
++ * DMI based code to deal with broken DSDTs on X86 tablets which ship with
++ * Android as (part of) the factory image. The factory kernels shipped on these
++ * devices typically have a bunch of things hardcoded, rather than specified
++ * in their DSDT.
++ *
++ * Copyright (C) 2021-2023 Hans de Goede <hdegoede@redhat.com>
++ */
++#ifndef __PDX86_X86_ANDROID_TABLETS_H
++#define __PDX86_X86_ANDROID_TABLETS_H
++
++#include <linux/gpio/consumer.h>
++#include <linux/gpio_keys.h>
++#include <linux/i2c.h>
++#include <linux/irqdomain.h>
++#include <linux/spi/spi.h>
++
++struct gpio_desc;
++struct gpiod_lookup_table;
++struct platform_device_info;
++struct software_node;
++
++/*
++ * Helpers to get Linux IRQ numbers given a description of the IRQ source
++ * (either IOAPIC index, or GPIO chip name + pin-number).
++ */
++enum x86_acpi_irq_type {
++	X86_ACPI_IRQ_TYPE_NONE,
++	X86_ACPI_IRQ_TYPE_APIC,
++	X86_ACPI_IRQ_TYPE_GPIOINT,
++	X86_ACPI_IRQ_TYPE_PMIC,
++};
++
++struct x86_acpi_irq_data {
++	char *chip;   /* GPIO chip label (GPIOINT) or PMIC ACPI path (PMIC) */
++	enum x86_acpi_irq_type type;
++	enum irq_domain_bus_token domain;
++	int index;
++	int trigger;  /* ACPI_EDGE_SENSITIVE / ACPI_LEVEL_SENSITIVE */
++	int polarity; /* ACPI_ACTIVE_HIGH / ACPI_ACTIVE_LOW / ACPI_ACTIVE_BOTH */
++	bool free_gpio; /* Release GPIO after getting IRQ (for TYPE_GPIOINT) */
++	const char *con_id;
++};
++
++/* Structs to describe devices to instantiate */
++struct x86_i2c_client_info {
++	struct i2c_board_info board_info;
++	char *adapter_path;
++	struct x86_acpi_irq_data irq_data;
++};
++
++struct x86_spi_dev_info {
++	struct spi_board_info board_info;
++	char *ctrl_path;
++	struct x86_acpi_irq_data irq_data;
++};
++
++struct x86_serdev_info {
++	union {
++		struct {
++			const char *hid;
++			const char *uid;
++		} acpi;
++		struct {
++			unsigned int devfn;
++		} pci;
++	} ctrl;
++	const char *ctrl_devname;
++	/*
++	 * ATM the serdev core only supports of or ACPI matching; and so far all
++	 * Android x86 tablets DSDTs have usable serdev nodes, but sometimes
++	 * under the wrong controller. So we just tie the existing serdev ACPI
++	 * node to the right controller.
++	 */
++	const char *serdev_hid;
++};
++
++struct x86_gpio_button {
++	struct gpio_keys_button button;
++	const char *chip;
++	int pin;
++};
++
++struct x86_dev_info {
++	const char * const *modules;
++	const struct software_node *bat_swnode;
++	struct gpiod_lookup_table * const *gpiod_lookup_tables;
++	const struct x86_i2c_client_info *i2c_client_info;
++	const struct x86_spi_dev_info *spi_dev_info;
++	const struct platform_device_info *pdev_info;
++	const struct x86_serdev_info *serdev_info;
++	const struct x86_gpio_button *gpio_button;
++	int i2c_client_count;
++	int spi_dev_count;
++	int pdev_count;
++	int serdev_count;
++	int gpio_button_count;
++	int (*init)(struct device *dev);
++	void (*exit)(void);
++	bool use_pci;
++};
++
++int x86_android_tablet_get_gpiod(const char *chip, int pin, const char *con_id,
++				 bool active_low, enum gpiod_flags dflags,
++				 struct gpio_desc **desc);
++int x86_acpi_irq_helper_get(const struct x86_acpi_irq_data *data);
++
++/*
++ * Extern declarations of x86_dev_info structs so there can be a single
++ * MODULE_DEVICE_TABLE(dmi, ...), while splitting the board descriptions.
++ */
++extern const struct x86_dev_info xiaomi_mipad2_info;
++extern const struct dmi_system_id x86_android_tablet_ids[];
++
++#endif
+-- 
+2.52.0
+diff --git a/include/linux/i2c.h b/include/linux/i2c.h
+index a670ae129..0009952bd 100644
+--- a/include/linux/i2c.h
++++ b/include/linux/i2c.h
+@@ -415,6 +415,7 @@ struct i2c_board_info {
+ 	void		*platform_data;
+ 	struct device_node *of_node;
+ 	struct fwnode_handle *fwnode;
++	const struct software_node *swnode;
+ 	const struct property_entry *properties;
+ 	const struct resource *resources;
+ 	unsigned int	num_resources;

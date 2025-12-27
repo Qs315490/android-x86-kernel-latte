@@ -1,0 +1,17 @@
+diff --git a/tools/lib/subcmd/subcmd-util.h b/tools/lib/subcmd/subcmd-util.h
+index 794a375da..a11226cf5 100644
+--- a/tools/lib/subcmd/subcmd-util.h
++++ b/tools/lib/subcmd/subcmd-util.h
+@@ -53,11 +53,7 @@ static inline void *xrealloc(void *ptr, size_t size)
+ 	if (!ret && !size)
+ 		ret = realloc(ptr, 1);
+ 	if (!ret) {
+-		ret = realloc(ptr, size);
+-		if (!ret && !size)
+-			ret = realloc(ptr, 1);
+-		if (!ret)
+-			die("Out of memory, realloc failed");
++		die("Out of memory, realloc failed");
+ 	}
+ 	return ret;
+ }

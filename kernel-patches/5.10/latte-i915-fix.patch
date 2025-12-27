@@ -1,0 +1,117 @@
+diff --color -u a/drivers/gpu/drm/i915/display/intel_display.c b/drivers/gpu/drm/i915/display/intel_display.c
+--- a/drivers/gpu/drm/i915/display/intel_display.c	2025-04-27 15:25:09.834101149 +0800
++++ b/drivers/gpu/drm/i915/display/intel_display.c	2025-04-27 15:33:23.685520296 +0800
+@@ -12240,6 +12240,8 @@ int intel_modeset_init_noirq(struct drm_i915_private *i915)
+ 	if (ret)
+ 		goto cleanup_bios;
+ 
++	intel_init_quirks(i915);
++
+ 	/* FIXME: completely on the wrong abstraction layer */
+ 	ret = intel_power_domains_init(i915);
+ 	if (ret < 0)
+@@ -12274,8 +12276,6 @@ int intel_modeset_init_noirq(struct drm_i915_private *i915)
+ 	INIT_WORK(&i915->atomic_helper.free_work,
+ 		  intel_atomic_helper_free_state_worker);
+ 
+-	intel_init_quirks(i915);
+-
+ 	intel_fbc_init(i915);
+ 
+ 	return 0;
+diff --color -u a/drivers/gpu/drm/i915/display/intel_display_power.c b/drivers/gpu/drm/i915/display/intel_display_power.c
+--- a/drivers/gpu/drm/i915/display/intel_display_power.c	2025-04-27 15:25:09.834101149 +0800
++++ b/drivers/gpu/drm/i915/display/intel_display_power.c	2025-04-27 15:31:38.759355555 +0800
+@@ -2090,8 +2090,14 @@ __intel_display_power_get_domain(struct drm_i915_private *dev_priv,
+ 	if (intel_display_power_grab_async_put_ref(dev_priv, domain))
+ 		return;
+ 
+-	for_each_power_domain_well(dev_priv, power_well, BIT_ULL(domain))
++	for_each_power_domain_well(dev_priv, power_well, BIT_ULL(domain)) {
++		if (domain == POWER_DOMAIN_INIT &&
++				(dev_priv->quirks & QUIRK_NO_VLV_DISP_PW_DPIO_CMN_BC_INIT) &&
++				power_well->desc->id == VLV_DISP_PW_DPIO_CMN_BC)
++			continue;
++
+ 		intel_power_well_get(dev_priv, power_well);
++	}
+ 
+ 	power_domains->domain_use_count[domain]++;
+ }
+@@ -2184,8 +2190,14 @@ __intel_display_power_put_domain(struct drm_i915_private *dev_priv,
+ 
+ 	power_domains->domain_use_count[domain]--;
+ 
+-	for_each_power_domain_well_reverse(dev_priv, power_well, BIT_ULL(domain))
++	for_each_power_domain_well_reverse(dev_priv, power_well, BIT_ULL(domain)) {
++		if (domain == POWER_DOMAIN_INIT &&
++				(dev_priv->quirks & QUIRK_NO_VLV_DISP_PW_DPIO_CMN_BC_INIT) &&
++				power_well->desc->id == VLV_DISP_PW_DPIO_CMN_BC)
++			continue;
++
+ 		intel_power_well_put(dev_priv, power_well);
++	}
+ }
+ 
+ static void __intel_display_power_put(struct drm_i915_private *dev_priv,
+diff --git a/drivers/gpu/drm/i915/display/intel_quirks.c b/drivers/gpu/drm/i915/display/intel_quirks.c
+--- a/drivers/gpu/drm/i915/display/intel_quirks.c
++++ b/drivers/gpu/drm/i915/display/intel_quirks.c
+@@ -59,6 +59,13 @@ static void quirk_no_pps_backlight_power_hook(struct drm_i915_private *i915)
+ 	drm_info(&i915->drm, "Applying no pps backlight power quirk\n");
+ }
+ 
++/* The Xiaomi Mi Pad 2 CHT tablet hangs on enabling the dpio-common-bc well */
++static void quirk_no_vlv_disp_pw_dpio_cmn_bc_init(struct drm_i915_private *i915)
++{
++	i915->quirks |= QUIRK_NO_VLV_DISP_PW_DPIO_CMN_BC_INIT;
++	drm_info(&i915->drm, "Applying no dpio-common-bc powerwell init quirk\n");
++}
++
+ struct intel_quirk {
+ 	int device;
+ 	int subsystem_vendor;
+@@ -203,5 +210,8 @@ static struct intel_quirk intel_quirks[] = {
+ 	{ 0x3185, 0x1849, 0x2212, quirk_increase_ddi_disabled_time },
+ 	{ 0x3184, 0x1849, 0x2212, quirk_increase_ddi_disabled_time },
++
++	/* Xiaomi Mi Pad 2 */
++	{ 0x22b0, 0x1d72, 0x1502, quirk_no_vlv_disp_pw_dpio_cmn_bc_init },
+ };
+ 
+ void intel_init_quirks(struct drm_i915_private *i915)
+diff --git a/drivers/gpu/drm/i915/i915_drv.h b/drivers/gpu/drm/i915/i915_drv.h
+index 005b1ce..b907b49 100755
+--- a/drivers/gpu/drm/i915/i915_drv.h
++++ b/drivers/gpu/drm/i915/i915_drv.h
+@@ -524,6 +524,7 @@ struct i915_drrs {
+ #define QUIRK_PIN_SWIZZLED_PAGES (1<<5)
+ #define QUIRK_INCREASE_T12_DELAY (1<<6)
+ #define QUIRK_INCREASE_DDI_DISABLED_TIME (1<<7)
++#define QUIRK_NO_VLV_DISP_PW_DPIO_CMN_BC_INIT (1<<8)
+ 
+ struct intel_fbdev;
+ struct intel_fbc_work;
+diff --git a/drivers/gpu/drm/i915/display/vlv_dsi.c b/drivers/gpu/drm/i915/display/vlv_dsi.c
+--- a/drivers/gpu/drm/i915/display/vlv_dsi.c
++++ b/drivers/gpu/drm/i915/display/vlv_dsi.c
+@@ -1262,7 +1262,9 @@ static void intel_dsi_get_config(struct intel_encoder *encoder,
+ 				 struct intel_crtc_state *pipe_config)
+ {
+ 	struct drm_i915_private *dev_priv = to_i915(encoder->base.dev);
++	struct intel_dsi *intel_dsi = enc_to_intel_dsi(encoder);
+ 	u32 pclk;
++
+ 	drm_dbg_kms(&dev_priv->drm, "\n");
+ 
+ 	pipe_config->output_types |= BIT(INTEL_OUTPUT_DSI);
+@@ -1274,6 +1276,9 @@ static void intel_dsi_get_config(struct intel_encoder *encoder,
+ 		pclk = vlv_dsi_get_pclk(encoder, pipe_config);
+ 	}
+ 
++	if (intel_dsi->dual_link)
++		pclk *= 2;
++
+ 	if (pclk) {
+ 		pipe_config->hw.adjusted_mode.crtc_clock = pclk;
+ 		pipe_config->port_clock = pclk;

@@ -1,0 +1,287 @@
+From 06cdf645d6039b9db475d908d2fac4b1057828cf Mon Sep 17 00:00:00 2001
+From: Qs315490 <qs315490@qq.com>
+Date: Tue, 23 Dec 2025 16:05:20 +0800
+Subject: [PATCH] backport: Add support for new touch devices and improve touch
+ handling
+
+---
+ drivers/hid/hid-multitouch.c | 86 +++++++++++++++++++++++++-----------
+ include/linux/hid.h          |  1 +
+ 2 files changed, 61 insertions(+), 26 deletions(-)
+
+diff --git a/drivers/hid/hid-multitouch.c b/drivers/hid/hid-multitouch.c
+index ed3263818..51f78201a 100644
+--- a/drivers/hid/hid-multitouch.c
++++ b/drivers/hid/hid-multitouch.c
+@@ -31,6 +31,8 @@
+  * [1] https://gitlab.freedesktop.org/libevdev/hid-tools
+  */
+ 
++
++#include <linux/bits.h>
+ #include <linux/device.h>
+ #include <linux/hid.h>
+ #include <linux/module.h>
+@@ -72,6 +74,7 @@ MODULE_LICENSE("GPL");
+ #define MT_QUIRK_WIN8_PTP_BUTTONS	BIT(18)
+ #define MT_QUIRK_SEPARATE_APP_REPORT	BIT(19)
+ #define MT_QUIRK_FORCE_MULTI_INPUT	BIT(20)
++#define MT_QUIRK_TOUCH_IS_TIPSTATE	BIT(21)
+ 
+ #define MT_INPUTMODE_TOUCHSCREEN	0x02
+ #define MT_INPUTMODE_TOUCHPAD		0x03
+@@ -83,6 +86,13 @@ enum latency_mode {
+ 	HID_LATENCY_HIGH = 1,
+ };
+ 
++enum report_mode {
++	TOUCHPAD_REPORT_NONE = 0,
++	TOUCHPAD_REPORT_BUTTONS = BIT(0),
++	TOUCHPAD_REPORT_CONTACTS = BIT(1),
++	TOUCHPAD_REPORT_ALL = TOUCHPAD_REPORT_BUTTONS | TOUCHPAD_REPORT_CONTACTS,
++};
++
+ #define MT_IO_FLAGS_RUNNING		0
+ #define MT_IO_FLAGS_ACTIVE_SLOTS	1
+ #define MT_IO_FLAGS_PENDING_SLOTS	2
+@@ -130,7 +140,6 @@ struct mt_application {
+ 				 * > 1 means hybrid (multitouch) protocol
+ 				 */
+ 
+-	__s32 dev_time;		/* the scan time provided by the device */
+ 	unsigned long jiffies;	/* the frame's jiffies */
+ 	int timestamp;		/* the timestamp to be sent */
+ 	int prev_scantime;		/* scantime reported previously */
+@@ -146,6 +155,7 @@ struct mt_class {
+ 	__s32 sn_height;	/* Signal/noise ratio for height events */
+ 	__s32 sn_pressure;	/* Signal/noise ratio for pressure events */
+ 	__u8 maxcontacts;
++	bool is_direct;	/* true for touchscreens */
+ 	bool is_indirect;	/* true for touchpads */
+ 	bool export_all_inputs;	/* do not ignore mouse, keyboards, etc... */
+ };
+@@ -494,9 +504,6 @@ static void mt_feature_mapping(struct hid_device *hdev,
+ 		if (!td->maxcontacts &&
+ 		    field->logical_maximum <= MT_MAX_MAXCONTACT)
+ 			td->maxcontacts = field->logical_maximum;
+-		if (td->mtclass.maxcontacts)
+-			/* check if the maxcontacts is given by the class */
+-			td->maxcontacts = td->mtclass.maxcontacts;
+ 
+ 		break;
+ 	case HID_DG_BUTTONTYPE:
+@@ -570,13 +577,13 @@ static struct mt_application *mt_allocate_application(struct mt_device *td,
+ 	mt_application->application = application;
+ 	INIT_LIST_HEAD(&mt_application->mt_usages);
+ 
+-	if (application == HID_DG_TOUCHSCREEN)
++	if (application == HID_DG_TOUCHSCREEN && !td->mtclass.is_indirect)
+ 		mt_application->mt_flags |= INPUT_MT_DIRECT;
+ 
+ 	/*
+ 	 * Model touchscreens providing buttons as touchpads.
+ 	 */
+-	if (application == HID_DG_TOUCHPAD) {
++	if (application == HID_DG_TOUCHPAD && !td->mtclass.is_direct) {
+ 		mt_application->mt_flags |= INPUT_MT_POINTER;
+ 		td->inputmode_value = MT_INPUTMODE_TOUCHPAD;
+ 	}
+@@ -640,7 +647,9 @@ static struct mt_report_data *mt_allocate_report_data(struct mt_device *td,
+ 
+ 		if (field->logical == HID_DG_FINGER || td->hdev->group != HID_GROUP_MULTITOUCH_WIN_8) {
+ 			for (n = 0; n < field->report_count; n++) {
+-				if (field->usage[n].hid == HID_DG_CONTACTID) {
++				unsigned int hid = field->usage[n].hid;
++
++				if (hid == HID_DG_CONTACTID || hid == HID_DG_TRANSDUCER_INDEX) {
+ 					rdata->is_mt_collection = true;
+ 					break;
+ 				}
+@@ -812,6 +821,15 @@ static int mt_touch_input_mapping(struct hid_device *hdev, struct hid_input *hi,
+ 
+ 			MT_STORE_FIELD(confidence_state);
+ 			return 1;
++		case HID_DG_TOUCH:
++			/*
++			 * Legacy devices use TIPSWITCH and not TOUCH.
++			 * Let's just ignore this field unless the quirk is set.
++			 */
++			if (!(cls->quirks & MT_QUIRK_TOUCH_IS_TIPSTATE))
++				return -1;
++
++			fallthrough;
+ 		case HID_DG_TIPSWITCH:
+ 			if (field->application != HID_GD_SYSTEM_MULTIAXIS)
+ 				input_set_capability(hi->input,
+@@ -819,6 +837,7 @@ static int mt_touch_input_mapping(struct hid_device *hdev, struct hid_input *hi,
+ 			MT_STORE_FIELD(tip_state);
+ 			return 1;
+ 		case HID_DG_CONTACTID:
++		case HID_DG_TRANSDUCER_INDEX:
+ 			MT_STORE_FIELD(contactid);
+ 			app->touches_by_report++;
+ 			return 1;
+@@ -874,10 +893,6 @@ static int mt_touch_input_mapping(struct hid_device *hdev, struct hid_input *hi,
+ 		case HID_DG_CONTACTMAX:
+ 			/* contact max are global to the report */
+ 			return -1;
+-		case HID_DG_TOUCH:
+-			/* Legacy devices use TIPSWITCH and not TOUCH.
+-			 * Let's just ignore this field. */
+-			return -1;
+ 		}
+ 		/* let hid-input decide for the others */
+ 		return 0;
+@@ -1305,6 +1320,10 @@ static int mt_touch_input_configured(struct hid_device *hdev,
+ 	struct input_dev *input = hi->input;
+ 	int ret;
+ 
++	/* check if the maxcontacts is given by the class */
++	if (cls->maxcontacts)
++		td->maxcontacts = cls->maxcontacts;
++
+ 	if (!td->maxcontacts)
+ 		td->maxcontacts = MT_DEFAULT_MAXCONTACT;
+ 
+@@ -1312,6 +1331,9 @@ static int mt_touch_input_configured(struct hid_device *hdev,
+ 	if (td->serial_maybe)
+ 		mt_post_parse_default_settings(td, app);
+ 
++	if (cls->is_direct)
++		app->mt_flags |= INPUT_MT_DIRECT;
++
+ 	if (cls->is_indirect)
+ 		app->mt_flags |= INPUT_MT_POINTER;
+ 
+@@ -1467,8 +1489,7 @@ static bool mt_need_to_apply_feature(struct hid_device *hdev,
+ 				     struct hid_field *field,
+ 				     struct hid_usage *usage,
+ 				     enum latency_mode latency,
+-				     bool surface_switch,
+-				     bool button_switch,
++				     enum report_mode report_mode,
+ 				     bool *inputmode_found)
+ {
+ 	struct mt_device *td = hid_get_drvdata(hdev);
+@@ -1523,11 +1544,11 @@ static bool mt_need_to_apply_feature(struct hid_device *hdev,
+ 		return true;
+ 
+ 	case HID_DG_SURFACESWITCH:
+-		field->value[index] = surface_switch;
++		field->value[index] = !!(report_mode & TOUCHPAD_REPORT_CONTACTS);
+ 		return true;
+ 
+ 	case HID_DG_BUTTONSWITCH:
+-		field->value[index] = button_switch;
++		field->value[index] = !!(report_mode & TOUCHPAD_REPORT_BUTTONS);
+ 		return true;
+ 	}
+ 
+@@ -1535,7 +1556,7 @@ static bool mt_need_to_apply_feature(struct hid_device *hdev,
+ }
+ 
+ static void mt_set_modes(struct hid_device *hdev, enum latency_mode latency,
+-			 bool surface_switch, bool button_switch)
++			 enum report_mode report_mode)
+ {
+ 	struct hid_report_enum *rep_enum;
+ 	struct hid_report *rep;
+@@ -1560,8 +1581,7 @@ static void mt_set_modes(struct hid_device *hdev, enum latency_mode latency,
+ 							     rep->field[i],
+ 							     usage,
+ 							     latency,
+-							     surface_switch,
+-							     button_switch,
++							     report_mode,
+ 							     &inputmode_found))
+ 					update_report = true;
+ 			}
+@@ -1643,9 +1663,6 @@ static int mt_input_configured(struct hid_device *hdev, struct hid_input *hi)
+ 	case HID_DG_STYLUS:
+ 		/* force BTN_STYLUS to allow tablet matching in udev */
+ 		__set_bit(BTN_STYLUS, hi->input->keybit);
+-		fallthrough;
+-	case HID_DG_PEN:
+-		suffix = "Stylus";
+ 		break;
+ 	default:
+ 		suffix = "UNKNOWN";
+@@ -1811,7 +1828,7 @@ static int mt_probe(struct hid_device *hdev, const struct hid_device_id *id)
+ 		dev_warn(&hdev->dev, "Cannot allocate sysfs group for %s\n",
+ 				hdev->name);
+ 
+-	mt_set_modes(hdev, HID_LATENCY_NORMAL, true, true);
++	mt_set_modes(hdev, HID_LATENCY_NORMAL, TOUCHPAD_REPORT_ALL);
+ 
+ 	return 0;
+ }
+@@ -1834,7 +1851,7 @@ static int mt_suspend(struct hid_device *hdev, pm_message_t state)
+ static int mt_reset_resume(struct hid_device *hdev)
+ {
+ 	mt_release_contacts(hdev);
+-	mt_set_modes(hdev, HID_LATENCY_NORMAL, true, true);
++	mt_set_modes(hdev, HID_LATENCY_NORMAL, TOUCHPAD_REPORT_ALL);
+ 	return 0;
+ }
+ 
+@@ -1846,5 +1865,7 @@ static int mt_resume(struct hid_device *hdev)
+ 
+ 	hid_hw_idle(hdev, 0, 0, HID_REQ_SET_IDLE);
+ 
++	mt_set_modes(hdev, HID_LATENCY_NORMAL, TOUCHPAD_REPORT_ALL);
++
+ 	return 0;
+ }
+@@ -2007,6 +2024,10 @@ static const struct hid_device_id mt_devices[] = {
+ 		HID_DEVICE(BUS_I2C, HID_GROUP_MULTITOUCH_WIN_8,
+ 			USB_VENDOR_ID_ELAN, 0x313a) },
+ 
++	{ .driver_data = MT_CLS_WIN_8_FORCE_MULTI_INPUT,
++		HID_DEVICE(BUS_I2C, HID_GROUP_MULTITOUCH_WIN_8,
++			USB_VENDOR_ID_ELAN, 0x32ae) },
++
+ 	/* Elitegroup panel */
+ 	{ .driver_data = MT_CLS_SERIAL,
+ 		MT_USB_DEVICE(USB_VENDOR_ID_ELITEGROUP,
+@@ -2156,6 +2177,14 @@ static const struct hid_device_id mt_devices[] = {
+ 			USB_DEVICE_ID_MTP_STM)},
+ 
+ 	/* Synaptics devices */
++	{ .driver_data = MT_CLS_WIN_8_FORCE_MULTI_INPUT,
++		HID_DEVICE(BUS_I2C, HID_GROUP_MULTITOUCH_WIN_8,
++			USB_VENDOR_ID_SYNAPTICS, 0xcd7e) },
++
++	{ .driver_data = MT_CLS_WIN_8_FORCE_MULTI_INPUT,
++		HID_DEVICE(BUS_I2C, HID_GROUP_MULTITOUCH_WIN_8,
++			USB_VENDOR_ID_SYNAPTICS, 0xcddc) },
++
+ 	{ .driver_data = MT_CLS_WIN_8_FORCE_MULTI_INPUT,
+ 		HID_DEVICE(BUS_I2C, HID_GROUP_MULTITOUCH_WIN_8,
+ 			USB_VENDOR_ID_SYNAPTICS, 0xce08) },
+@@ -2249,6 +2278,11 @@ static const struct hid_device_id mt_devices[] = {
+ 		HID_DEVICE(BUS_USB, HID_GROUP_MULTITOUCH_WIN_8, USB_VENDOR_ID_GOOGLE,
+ 			USB_DEVICE_ID_GOOGLE_WHISKERS) },
+ 
++	/* Hantick */
++	{ .driver_data = MT_CLS_NSMU,
++		HID_DEVICE(BUS_I2C, HID_GROUP_MULTITOUCH_WIN_8,
++			   I2C_VENDOR_ID_HANTICK, I2C_PRODUCT_ID_HANTICK_5288) },
++
+ 	/* Generic MT device */
+ 	{ HID_DEVICE(HID_BUS_ANY, HID_GROUP_MULTITOUCH, HID_ANY_ID, HID_ANY_ID) },
+ 
+diff --git a/include/linux/hid.h b/include/linux/hid.h
+index 92965bcb8..b580a1dec 100644
+--- a/include/linux/hid.h
++++ b/include/linux/hid.h
+@@ -243,6 +243,7 @@ struct hid_item {
+ #define HID_DG_TOUCH		0x000d0033
+ #define HID_DG_UNTOUCH		0x000d0034
+ #define HID_DG_TAP		0x000d0035
++#define HID_DG_TRANSDUCER_INDEX	0x000d0038
+ #define HID_DG_TABLETFUNCTIONKEY	0x000d0039
+ #define HID_DG_PROGRAMCHANGEKEY	0x000d003a
+ #define HID_DG_BATTERYSTRENGTH	0x000d003b
+-- 
+2.52.0
+

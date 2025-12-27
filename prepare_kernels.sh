@@ -49,7 +49,8 @@ download_and_patch_kernels()
 		git clone --depth=1 --single-branch $kernel_remote_path -b $kernel_remote_branch --recursive ./kernels/$kernel || { echo -e "${RED_COLOR}Download kernel $kernel failed!$NORMAL_COLOR"; exit 1; }
 
 		# 对于没有ksu内核，集成SukiSU-Ultra。非GKI模式
-		if [ "${kernel_info[\"$kernel,ksu\"]}" == "true" ];then
+		ksu=${kernel_info["$kernel,ksu"]}
+		if [ "$ksu" == "true" ];then
 			echo -e "${BLUE_COLOR}Kernel $kernel is not KernelSU kernel, SukiSU-Ultra integration$NORMAL_COLOR"
 			pushd ./kernels/$kernel
 			curl -LSs "https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/main/kernel/setup.sh" | bash -s nongki
@@ -66,8 +67,15 @@ rm -rf kernels
 GITHUB_URL=https://github.com
 
 declare -A kernel_info=(
+	["5.10,url"]=$GITHUB_URL/android-generic/kernel_common
+	["5.10,branch"]="kernel-5.10.70"
+	["5.10,ksu"]="false"
 	["5.15,url"]=$GITHUB_URL/android-generic/kernel_common
 	["5.15,branch"]="umbral-20230901"
+	["6.1,url"]=$GITHUB_URL/android-generic/kernel_common
+	["6.1,branch"]="hm/gloria"
+	["6.6,url"]=$GITHUB_URL/android-generic/kernel_common
+	["6.6,branch"]="hm/crimson"
 	["6.12,url"]=$GITHUB_URL/android-generic/kernel-zenith
 	["6.12,branch"]="6.12"
 	["6.15,url"]=$GITHUB_URL/android-generic/kernel-zenith

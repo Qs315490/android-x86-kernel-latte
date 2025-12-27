@@ -7,9 +7,14 @@ else
 fi
 
 root_dir=$(pwd)
-mkdir out
+mkdir -p out
 
-kernels=$(ls -d ./kernels/* | sed 's#./kernels/##g')
+if [ -z "$1" ]; then
+	kernels=$(ls -d ./kernels/* | sed 's#./kernels/##g')
+else
+	kernels="$1"
+fi
+
 for kernel in $kernels; do
 
     if [ ! -f "./kernels/$kernel/out/arch/x86/boot/bzImage" ];then
@@ -28,7 +33,7 @@ for kernel in $kernels; do
     cp -r ./headers/* $root_dir/tmp/$kernel/usr/src/linux-headers-"$kernel_version" || { echo "Failed to replace the build directory for kernel $kernel"; exit 1; }
 
     cd $root_dir/tmp/$kernel || { echo "Failed to enter directory for kernel $kernel"; exit 1; }
-    rm -rf lib/modules/*/build
+    rm -rf lib/modules/*/build lib/modules/*/source
     tar zcf $root_dir/out/kernel-"$kernel_version".tar.gz * --owner=0 --group=0 || { echo "Failed to create archive for kernel $kernel"; exit 1; }
     cd $root_dir || { echo "Failed to cleanup for kernel $kernel"; exit 1; }
     rm -rf ./tmp || { echo "Failed to cleanup for kernel $kernel"; exit 1; }
