@@ -54,7 +54,7 @@ download_and_patch_kernels()
 			echo -e "${BLUE_COLOR}Kernel $kernel is not KernelSU kernel, SukiSU-Ultra integration$NORMAL_COLOR"
 			pushd ./kernels/$kernel
 			rm -rf ./KernelSU
-			curl -LSs "https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/main/kernel/setup.sh" | bash -s nongki
+			curl -LSs "https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/main/kernel/setup.sh" | bash
 			popd
 		fi
 

@@ -200,6 +200,18 @@ index b16a844d1..9a43c44dc 100644
 +}
 +
  #endif
+diff --git a/sound/soc/soc-dapm.c b/sound/soc/soc-dapm.c
+index 148c095df..1ad5a44a1 100644
+--- a/sound/soc/soc-dapm.c
++++ b/sound/soc/soc-dapm.c
+@@ -1331,6 +1331,7 @@ int snd_soc_dapm_dai_get_connected_widgets(struct snd_soc_dai *dai, int stream,
+ 
+ 	return paths;
+ }
++EXPORT_SYMBOL_GPL(snd_soc_dapm_dai_get_connected_widgets);
+ 
+ void snd_soc_dapm_dai_free_widgets(struct snd_soc_dapm_widget_list **list)
+ {
 diff --git a/sound/soc/codecs/tfa989x.c b/sound/soc/codecs/tfa989x.c
 new file mode 100644
 index 000000000..ef4fe023e
