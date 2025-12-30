@@ -83,5 +83,5 @@ declare -A kernel_info=(
 	["6.15,branch"]="6.15"
 )
 
-kernels="${@:-5.15 6.12}"
+kernels="${@:-5.10 6.12}"
 download_and_patch_kernels
