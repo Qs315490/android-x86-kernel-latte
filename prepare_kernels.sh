@@ -53,6 +53,7 @@ download_and_patch_kernels()
 		if [ "$ksu" == "true" ];then
 			echo -e "${BLUE_COLOR}Kernel $kernel is not KernelSU kernel, SukiSU-Ultra integration$NORMAL_COLOR"
 			pushd ./kernels/$kernel
+			rm -rf ./KernelSU
 			curl -LSs "https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/main/kernel/setup.sh" | bash -s nongki
 			popd
 		fi
@@ -69,7 +70,7 @@ GITHUB_URL=https://github.com
 declare -A kernel_info=(
 	["5.10,url"]=$GITHUB_URL/android-generic/kernel_common
 	["5.10,branch"]="kernel-5.10.70"
-	["5.10,ksu"]="false"
+	["5.10,ksu"]="true"
 	["5.15,url"]=$GITHUB_URL/android-generic/kernel_common
 	["5.15,branch"]="umbral-20230901"
 	["6.1,url"]=$GITHUB_URL/android-generic/kernel_common
@@ -82,6 +83,5 @@ declare -A kernel_info=(
 	["6.15,branch"]="6.15"
 )
 
-kernels="${1:-5.15 6.12 6.15}"
+kernels="${@:-5.15 6.12}"
 download_and_patch_kernels
-
