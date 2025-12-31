@@ -254,13 +254,13 @@ index 000000000..2faa47a55
 +		return -ENOMEM;
 +
 +	lookup->dev_id = KBUILD_MODNAME;
-+	lookup->table[0] = (struct gpiod_lookup) {
-+		.key = chip,
-+		.chip_hwnum = pin,
-+		.con_id = con_id,
-+		.idx = 0,
-+		.flags = active_low ? GPIO_ACTIVE_LOW : GPIO_ACTIVE_HIGH,
-+	};
++
++	lookup->table[0].key = chip;
++	lookup->table[0].chip_hwnum = pin;
++	lookup->table[0].con_id = con_id;
++	lookup->table[0].idx = 0;
++	lookup->table[0].flags = active_low ? GPIO_ACTIVE_LOW : GPIO_ACTIVE_HIGH;
++	memset(&lookup->table[1], 0, sizeof(struct gpiod_lookup));
 +
 +	gpiod_add_lookup_table(lookup);
 +	gpiod = devm_gpiod_get(&x86_android_tablet_device->dev, con_id, dflags);
