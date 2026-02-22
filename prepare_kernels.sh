@@ -36,7 +36,7 @@ make_config()
 		config_file=./kernel-patches/${1}_defconfig
 	fi
 	cp $config_file ./kernels/$1/arch/x86/configs/mipad2_defconfig || { echo -e "${RED_COLOR}Kernel $1 configuration failed$NORMAL_COLOR"; exit 1; }
-	make -C ./kernels/$1 O=out mipad2_defconfig || { echo -e "${RED_COLOR}Kernel $1 configuration failed$NORMAL_COLOR"; exit 1; }
+	make -C ./kernels/$1 O=out LLVM=1 mipad2_defconfig || { echo -e "${RED_COLOR}Kernel $1 configuration failed$NORMAL_COLOR"; exit 1; }
 }
 
 download_and_patch_kernels()
