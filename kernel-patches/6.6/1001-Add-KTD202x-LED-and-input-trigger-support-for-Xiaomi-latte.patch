@@ -1,0 +1,1063 @@
+From de0caea19ad845d90f32e25f941500840d197d01 Mon Sep 17 00:00:00 2001
+From: Qs315490 <qs315490@qq.com>
+Date: Mon, 23 Feb 2026 12:43:08 +0800
+Subject: [PATCH] Add KTD202x LED and input trigger support for Xiaomi Mi Pad 2
+
+---
+ drivers/leds/rgb/Kconfig                      |  12 +
+ drivers/leds/rgb/Makefile                     |   1 +
+ drivers/leds/rgb/leds-ktd202x.c               | 635 ++++++++++++++++++
+ drivers/leds/trigger/Kconfig                  |  16 +
+ drivers/leds/trigger/Makefile                 |   1 +
+ drivers/leds/trigger/ledtrig-input-events.c   | 165 +++++
+ .../platform/x86/x86-android-tablets/other.c  | 131 ++++
+ 7 files changed, 961 insertions(+)
+ create mode 100644 drivers/leds/rgb/leds-ktd202x.c
+ create mode 100644 drivers/leds/trigger/ledtrig-input-events.c
+
+diff --git a/drivers/leds/rgb/Kconfig b/drivers/leds/rgb/Kconfig
+index 183bccc06..f245dbd9a 100644
+--- a/drivers/leds/rgb/Kconfig
++++ b/drivers/leds/rgb/Kconfig
+@@ -14,6 +14,18 @@ config LEDS_GROUP_MULTICOLOR
+ 	  To compile this driver as a module, choose M here: the module
+ 	  will be called leds-group-multicolor.
+ 
++config LEDS_KTD202X
++	tristate "LED support for KTD202x Chips"
++	depends on I2C
++	select REGMAP_I2C
++	help
++	  This option enables support for the Kinetic KTD2026/KTD2027
++	  RGB/White LED driver found in different BQ mobile phones.
++	  It is a 3 or 4 channel LED driver programmed via an I2C interface.
++
++	  To compile this driver as a module, choose M here: the module
++	  will be called leds-ktd202x.
++
+ config LEDS_PWM_MULTICOLOR
+ 	tristate "PWM driven multi-color LED Support"
+ 	depends on PWM
+diff --git a/drivers/leds/rgb/Makefile b/drivers/leds/rgb/Makefile
+index c11cc5638..243f31e4d 100644
+--- a/drivers/leds/rgb/Makefile
++++ b/drivers/leds/rgb/Makefile
+@@ -1,6 +1,7 @@
+ # SPDX-License-Identifier: GPL-2.0
+ 
+ obj-$(CONFIG_LEDS_GROUP_MULTICOLOR)	+= leds-group-multicolor.o
++obj-$(CONFIG_LEDS_KTD202X)		+= leds-ktd202x.o
+ obj-$(CONFIG_LEDS_PWM_MULTICOLOR)	+= leds-pwm-multicolor.o
+ obj-$(CONFIG_LEDS_QCOM_LPG)		+= leds-qcom-lpg.o
+ obj-$(CONFIG_LEDS_MT6370_RGB)		+= leds-mt6370-rgb.o
+diff --git a/drivers/leds/rgb/leds-ktd202x.c b/drivers/leds/rgb/leds-ktd202x.c
+new file mode 100644
+index 000000000..04e62faa3
+--- /dev/null
++++ b/drivers/leds/rgb/leds-ktd202x.c
+@@ -0,0 +1,635 @@
++// SPDX-License-Identifier: GPL-2.0-or-later
++/*
++ * Kinetic KTD2026/7 RGB/White LED driver with I2C interface
++ *
++ * Copyright 2023 André Apitzsch <git@apitzsch.eu>
++ *
++ * Datasheet: https://www.kinet-ic.com/uploads/KTD2026-7-04h.pdf
++ */
++
++#include <linux/i2c.h>
++#include <linux/led-class-multicolor.h>
++#include <linux/module.h>
++#include <linux/mutex.h>
++#include <linux/of.h>
++#include <linux/of_device.h>
++#include <linux/regmap.h>
++#include <linux/regulator/consumer.h>
++
++#define KTD2026_NUM_LEDS 3
++#define KTD2027_NUM_LEDS 4
++#define KTD202X_MAX_LEDS 4
++
++/* Register bank */
++#define KTD202X_REG_RESET_CONTROL	0x00
++#define KTD202X_REG_FLASH_PERIOD	0x01
++#define KTD202X_REG_PWM1_TIMER		0x02
++#define KTD202X_REG_PWM2_TIMER		0x03
++#define KTD202X_REG_CHANNEL_CTRL	0x04
++#define KTD202X_REG_TRISE_FALL		0x05
++#define KTD202X_REG_LED_IOUT(x)		(0x06 + (x))
++
++/* Register 0 */
++#define KTD202X_TIMER_SLOT_CONTROL_TSLOT1	0x00
++#define KTD202X_TIMER_SLOT_CONTROL_TSLOT2	0x01
++#define KTD202X_TIMER_SLOT_CONTROL_TSLOT3	0x02
++#define KTD202X_TIMER_SLOT_CONTROL_TSLOT4	0x03
++#define KTD202X_RSTR_RESET			0x07
++
++#define KTD202X_ENABLE_CTRL_WAKE	0x00 /* SCL High & SDA High */
++#define KTD202X_ENABLE_CTRL_SLEEP	0x08 /* SCL High & SDA Toggling */
++
++#define KTD202X_TRISE_FALL_SCALE_NORMAL		0x00
++#define KTD202X_TRISE_FALL_SCALE_SLOW_X2	0x20
++#define KTD202X_TRISE_FALL_SCALE_SLOW_X4	0x40
++#define KTD202X_TRISE_FALL_SCALE_FAST_X8	0x60
++
++/* Register 1 */
++#define KTD202X_FLASH_PERIOD_256_MS_LOG_RAMP	0x00
++
++/* Register 2-3 */
++#define KTD202X_FLASH_ON_TIME_0_4_PERCENT	0x01
++
++/* Register 4 */
++#define KTD202X_CHANNEL_CTRL_MASK(x) (BIT(2 * (x)) | BIT(2 * (x) + 1))
++#define KTD202X_CHANNEL_CTRL_OFF 0x00
++#define KTD202X_CHANNEL_CTRL_ON(x) BIT(2 * (x))
++#define KTD202X_CHANNEL_CTRL_PWM1(x) BIT(2 * (x) + 1)
++#define KTD202X_CHANNEL_CTRL_PWM2(x) (BIT(2 * (x)) | BIT(2 * (x) + 1))
++
++/* Register 5 */
++#define KTD202X_RAMP_TIMES_2_MS			0x00
++
++/* Register 6-9 */
++#define KTD202X_LED_CURRENT_10_mA		0x4f
++
++#define KTD202X_FLASH_PERIOD_MIN_MS 256
++#define KTD202X_FLASH_PERIOD_STEP_MS 128
++#define KTD202X_FLASH_PERIOD_MAX_STEPS 126
++#define KTD202X_FLASH_ON_MAX 256
++
++#define KTD202X_MAX_BRIGHTNESS 192
++
++static const struct reg_default ktd202x_reg_defaults[] = {
++	{ KTD202X_REG_RESET_CONTROL, KTD202X_TIMER_SLOT_CONTROL_TSLOT1 |
++		KTD202X_ENABLE_CTRL_WAKE | KTD202X_TRISE_FALL_SCALE_NORMAL },
++	{ KTD202X_REG_FLASH_PERIOD, KTD202X_FLASH_PERIOD_256_MS_LOG_RAMP },
++	{ KTD202X_REG_PWM1_TIMER, KTD202X_FLASH_ON_TIME_0_4_PERCENT },
++	{ KTD202X_REG_PWM2_TIMER, KTD202X_FLASH_ON_TIME_0_4_PERCENT },
++	{ KTD202X_REG_CHANNEL_CTRL, KTD202X_CHANNEL_CTRL_OFF },
++	{ KTD202X_REG_TRISE_FALL, KTD202X_RAMP_TIMES_2_MS },
++	{ KTD202X_REG_LED_IOUT(0), KTD202X_LED_CURRENT_10_mA },
++	{ KTD202X_REG_LED_IOUT(1), KTD202X_LED_CURRENT_10_mA },
++	{ KTD202X_REG_LED_IOUT(2), KTD202X_LED_CURRENT_10_mA },
++	{ KTD202X_REG_LED_IOUT(3), KTD202X_LED_CURRENT_10_mA },
++};
++
++struct ktd202x_led {
++	struct ktd202x *chip;
++	union {
++		struct led_classdev cdev;
++		struct led_classdev_mc mcdev;
++	};
++	u32 index;
++};
++
++struct ktd202x {
++	struct mutex mutex;
++	struct regulator_bulk_data regulators[2];
++	struct device *dev;
++	struct regmap *regmap;
++	bool enabled;
++	unsigned long num_leds;
++	struct ktd202x_led leds[] __counted_by(num_leds);
++};
++
++static int ktd202x_chip_disable(struct ktd202x *chip)
++{
++	int ret;
++
++	if (!chip->enabled)
++		return 0;
++
++	regmap_write(chip->regmap, KTD202X_REG_RESET_CONTROL, KTD202X_ENABLE_CTRL_SLEEP);
++
++	ret = regulator_bulk_disable(ARRAY_SIZE(chip->regulators), chip->regulators);
++	if (ret) {
++		dev_err(chip->dev, "Failed to disable regulators: %d\n", ret);
++		return ret;
++	}
++
++	chip->enabled = false;
++	return 0;
++}
++
++static int ktd202x_chip_enable(struct ktd202x *chip)
++{
++	int ret;
++
++	if (chip->enabled)
++		return 0;
++
++	ret = regulator_bulk_enable(ARRAY_SIZE(chip->regulators), chip->regulators);
++	if (ret) {
++		dev_err(chip->dev, "Failed to enable regulators: %d\n", ret);
++		return ret;
++	}
++	chip->enabled = true;
++
++	ret = regmap_write(chip->regmap, KTD202X_REG_RESET_CONTROL, KTD202X_ENABLE_CTRL_WAKE);
++
++	if (ret) {
++		dev_err(chip->dev, "Failed to enable the chip: %d\n", ret);
++		ktd202x_chip_disable(chip);
++	}
++
++	return ret;
++}
++
++static bool ktd202x_chip_in_use(struct ktd202x *chip)
++{
++	int i;
++
++	for (i = 0; i < chip->num_leds; i++) {
++		if (chip->leds[i].cdev.brightness)
++			return true;
++	}
++
++	return false;
++}
++
++static int ktd202x_brightness_set(struct ktd202x_led *led,
++				  struct mc_subled *subleds,
++				  unsigned int num_channels)
++{
++	bool mode_blink = false;
++	int channel;
++	int state;
++	int ret;
++	int i;
++
++	if (ktd202x_chip_in_use(led->chip)) {
++		ret = ktd202x_chip_enable(led->chip);
++		if (ret)
++			return ret;
++	}
++
++	ret = regmap_read(led->chip->regmap, KTD202X_REG_CHANNEL_CTRL, &state);
++	if (ret)
++		return ret;
++
++	/*
++	 * In multicolor case, assume blink mode if PWM is set for at least one
++	 * channel because another channel cannot be in state ON at the same time
++	 */
++	for (i = 0; i < num_channels; i++) {
++		int channel_state;
++
++		channel = subleds[i].channel;
++		channel_state = (state >> 2 * channel) & KTD202X_CHANNEL_CTRL_MASK(0);
++		if (channel_state == KTD202X_CHANNEL_CTRL_OFF)
++			continue;
++		mode_blink = channel_state == KTD202X_CHANNEL_CTRL_PWM1(0);
++		break;
++	}
++
++	for (i = 0; i < num_channels; i++) {
++		enum led_brightness brightness;
++		int mode;
++
++		brightness = subleds[i].brightness;
++		channel = subleds[i].channel;
++
++		if (brightness) {
++			/* Register expects brightness between 0 and MAX_BRIGHTNESS - 1 */
++			ret = regmap_write(led->chip->regmap, KTD202X_REG_LED_IOUT(channel),
++					   brightness - 1);
++			if (ret)
++				return ret;
++
++			if (mode_blink)
++				mode = KTD202X_CHANNEL_CTRL_PWM1(channel);
++			else
++				mode = KTD202X_CHANNEL_CTRL_ON(channel);
++		} else {
++			mode = KTD202X_CHANNEL_CTRL_OFF;
++		}
++		ret = regmap_update_bits(led->chip->regmap, KTD202X_REG_CHANNEL_CTRL,
++					 KTD202X_CHANNEL_CTRL_MASK(channel), mode);
++		if (ret)
++			return ret;
++	}
++
++	if (!ktd202x_chip_in_use(led->chip))
++		return ktd202x_chip_disable(led->chip);
++
++	return 0;
++}
++
++static int ktd202x_brightness_single_set(struct led_classdev *cdev,
++					 enum led_brightness value)
++{
++	struct ktd202x_led *led = container_of(cdev, struct ktd202x_led, cdev);
++	struct mc_subled info;
++	int ret;
++
++	cdev->brightness = value;
++
++	mutex_lock(&led->chip->mutex);
++
++	info.brightness = value;
++	info.channel = led->index;
++	ret = ktd202x_brightness_set(led, &info, 1);
++
++	mutex_unlock(&led->chip->mutex);
++
++	return ret;
++}
++
++static int ktd202x_brightness_mc_set(struct led_classdev *cdev,
++				     enum led_brightness value)
++{
++	struct led_classdev_mc *mc = lcdev_to_mccdev(cdev);
++	struct ktd202x_led *led = container_of(mc, struct ktd202x_led, mcdev);
++	int ret;
++
++	cdev->brightness = value;
++
++	mutex_lock(&led->chip->mutex);
++
++	led_mc_calc_color_components(mc, value);
++	ret = ktd202x_brightness_set(led, mc->subled_info, mc->num_colors);
++
++	mutex_unlock(&led->chip->mutex);
++
++	return ret;
++}
++
++static int ktd202x_blink_set(struct ktd202x_led *led, unsigned long *delay_on,
++			     unsigned long *delay_off, struct mc_subled *subleds,
++			     unsigned int num_channels)
++{
++	unsigned long delay_total_ms;
++	int ret, num_steps, on;
++	u8 ctrl_mask = 0;
++	u8 ctrl_pwm1 = 0;
++	u8 ctrl_on = 0;
++	int i;
++
++	mutex_lock(&led->chip->mutex);
++
++	for (i = 0; i < num_channels; i++) {
++		int channel = subleds[i].channel;
++
++		ctrl_mask |= KTD202X_CHANNEL_CTRL_MASK(channel);
++		ctrl_on |= KTD202X_CHANNEL_CTRL_ON(channel);
++		ctrl_pwm1 |= KTD202X_CHANNEL_CTRL_PWM1(channel);
++	}
++
++	/* Never off - brightness is already set, disable blinking */
++	if (!*delay_off) {
++		ret = regmap_update_bits(led->chip->regmap, KTD202X_REG_CHANNEL_CTRL,
++					 ctrl_mask, ctrl_on);
++		goto out;
++	}
++
++	/* Convert into values the HW will understand. */
++
++	/* Integer representation of time of flash period */
++	num_steps = (*delay_on + *delay_off - KTD202X_FLASH_PERIOD_MIN_MS) /
++		    KTD202X_FLASH_PERIOD_STEP_MS;
++	num_steps = clamp(num_steps, 0, KTD202X_FLASH_PERIOD_MAX_STEPS);
++
++	/* Integer representation of percentage of LED ON time */
++	on = (*delay_on * KTD202X_FLASH_ON_MAX) / (*delay_on + *delay_off);
++
++	/* Actually used delay_{on,off} values */
++	delay_total_ms = num_steps * KTD202X_FLASH_PERIOD_STEP_MS + KTD202X_FLASH_PERIOD_MIN_MS;
++	*delay_on = (delay_total_ms * on) / KTD202X_FLASH_ON_MAX;
++	*delay_off = delay_total_ms - *delay_on;
++
++	/* Set timings */
++	ret = regmap_write(led->chip->regmap, KTD202X_REG_FLASH_PERIOD, num_steps);
++	if (ret)
++		goto out;
++
++	ret = regmap_write(led->chip->regmap, KTD202X_REG_PWM1_TIMER, on);
++	if (ret)
++		goto out;
++
++	ret = regmap_update_bits(led->chip->regmap, KTD202X_REG_CHANNEL_CTRL,
++				 ctrl_mask, ctrl_pwm1);
++out:
++	mutex_unlock(&led->chip->mutex);
++	return ret;
++}
++
++static int ktd202x_blink_single_set(struct led_classdev *cdev,
++				    unsigned long *delay_on,
++				    unsigned long *delay_off)
++{
++	struct ktd202x_led *led = container_of(cdev, struct ktd202x_led, cdev);
++	struct mc_subled info;
++	int ret;
++
++	if (!cdev->brightness) {
++		ret = ktd202x_brightness_single_set(cdev, KTD202X_MAX_BRIGHTNESS);
++		if (ret)
++			return ret;
++	}
++
++	/* If no blink specified, default to 1 Hz. */
++	if (!*delay_off && !*delay_on) {
++		*delay_off = 500;
++		*delay_on = 500;
++	}
++
++	/* Never on - just set to off */
++	if (!*delay_on)
++		return ktd202x_brightness_single_set(cdev, LED_OFF);
++
++	info.channel = led->index;
++
++	return ktd202x_blink_set(led, delay_on, delay_off, &info, 1);
++}
++
++static int ktd202x_blink_mc_set(struct led_classdev *cdev,
++				unsigned long *delay_on,
++				unsigned long *delay_off)
++{
++	struct led_classdev_mc *mc = lcdev_to_mccdev(cdev);
++	struct ktd202x_led *led = container_of(mc, struct ktd202x_led, mcdev);
++	int ret;
++
++	if (!cdev->brightness) {
++		ret = ktd202x_brightness_mc_set(cdev, KTD202X_MAX_BRIGHTNESS);
++		if (ret)
++			return ret;
++	}
++
++	/* If no blink specified, default to 1 Hz. */
++	if (!*delay_off && !*delay_on) {
++		*delay_off = 500;
++		*delay_on = 500;
++	}
++
++	/* Never on - just set to off */
++	if (!*delay_on)
++		return ktd202x_brightness_mc_set(cdev, LED_OFF);
++
++	return ktd202x_blink_set(led, delay_on, delay_off, mc->subled_info,
++				 mc->num_colors);
++}
++
++static int ktd202x_setup_led_rgb(struct ktd202x *chip, struct fwnode_handle *fwnode,
++				 struct ktd202x_led *led, struct led_init_data *init_data)
++{
++	struct fwnode_handle *child;
++	struct led_classdev *cdev;
++	struct mc_subled *info;
++	int num_channels;
++	int i = 0;
++
++	num_channels = 0;
++	fwnode_for_each_available_child_node(fwnode, child)
++		num_channels++;
++
++	if (!num_channels || num_channels > chip->num_leds)
++		return -EINVAL;
++
++	info = devm_kcalloc(chip->dev, num_channels, sizeof(*info), GFP_KERNEL);
++	if (!info)
++		return -ENOMEM;
++
++	fwnode_for_each_available_child_node(fwnode, child) {
++		u32 mono_color;
++		u32 reg;
++		int ret;
++
++		ret = fwnode_property_read_u32(child, "reg", &reg);
++		if (ret != 0 || reg >= chip->num_leds) {
++			dev_err(chip->dev, "invalid 'reg' of %pfw\n", child);
++			fwnode_handle_put(child);
++			return ret;
++		}
++
++		ret = fwnode_property_read_u32(child, "color", &mono_color);
++		if (ret < 0 && ret != -EINVAL) {
++			dev_err(chip->dev, "failed to parse 'color' of %pfw\n", child);
++			fwnode_handle_put(child);
++			return ret;
++		}
++
++		info[i].color_index = mono_color;
++		info[i].channel = reg;
++		info[i].intensity = KTD202X_MAX_BRIGHTNESS;
++		i++;
++	}
++
++	led->mcdev.subled_info = info;
++	led->mcdev.num_colors = num_channels;
++
++	cdev = &led->mcdev.led_cdev;
++	cdev->brightness_set_blocking = ktd202x_brightness_mc_set;
++	cdev->blink_set = ktd202x_blink_mc_set;
++
++	return devm_led_classdev_multicolor_register_ext(chip->dev, &led->mcdev, init_data);
++}
++
++static int ktd202x_setup_led_single(struct ktd202x *chip, struct fwnode_handle *fwnode,
++				    struct ktd202x_led *led, struct led_init_data *init_data)
++{
++	struct led_classdev *cdev;
++	u32 reg;
++	int ret;
++
++	ret = fwnode_property_read_u32(fwnode, "reg", &reg);
++	if (ret != 0 || reg >= chip->num_leds) {
++		dev_err(chip->dev, "invalid 'reg' of %pfw\n", fwnode);
++		return -EINVAL;
++	}
++	led->index = reg;
++
++	cdev = &led->cdev;
++	cdev->brightness_set_blocking = ktd202x_brightness_single_set;
++	cdev->blink_set = ktd202x_blink_single_set;
++
++	return devm_led_classdev_register_ext(chip->dev, &led->cdev, init_data);
++}
++
++static int ktd202x_add_led(struct ktd202x *chip, struct fwnode_handle *fwnode, unsigned int index)
++{
++	struct ktd202x_led *led = &chip->leds[index];
++	struct led_init_data init_data = {};
++	struct led_classdev *cdev;
++	u32 color;
++	int ret;
++
++	/* Color property is optional in single color case */
++	ret = fwnode_property_read_u32(fwnode, "color", &color);
++	if (ret < 0 && ret != -EINVAL) {
++		dev_err(chip->dev, "failed to parse 'color' of %pfw\n", fwnode);
++		return ret;
++	}
++
++	led->chip = chip;
++	init_data.fwnode = fwnode;
++
++	if (color == LED_COLOR_ID_RGB) {
++		cdev = &led->mcdev.led_cdev;
++		ret = ktd202x_setup_led_rgb(chip, fwnode, led, &init_data);
++	} else {
++		cdev = &led->cdev;
++		ret = ktd202x_setup_led_single(chip, fwnode, led, &init_data);
++	}
++
++	if (ret) {
++		dev_err(chip->dev, "unable to register %s\n", cdev->name);
++		return ret;
++	}
++
++	cdev->max_brightness = KTD202X_MAX_BRIGHTNESS;
++
++	return 0;
++}
++
++static int ktd202x_probe_fw(struct ktd202x *chip)
++{
++	struct device *dev = chip->dev;
++	int count;
++	int i = 0;
++
++	count = device_get_child_node_count(dev);
++	if (!count || count > chip->num_leds)
++		return -EINVAL;
++
++	regmap_write(chip->regmap, KTD202X_REG_RESET_CONTROL, KTD202X_RSTR_RESET);
++
++	/* Allow the device to execute the complete reset */
++	usleep_range(200, 300);
++
++	device_for_each_child_node_scoped(dev, child) {
++		int ret = ktd202x_add_led(chip, child, i);
++
++		if (ret)
++			return ret;
++
++		i++;
++	}
++
++	return 0;
++}
++
++static const struct regmap_config ktd202x_regmap_config = {
++	.reg_bits = 8,
++	.val_bits = 8,
++	.max_register = 0x09,
++	.cache_type = REGCACHE_FLAT,
++	.reg_defaults = ktd202x_reg_defaults,
++	.num_reg_defaults = ARRAY_SIZE(ktd202x_reg_defaults),
++};
++
++static int ktd202x_probe(struct i2c_client *client)
++{
++	struct device *dev = &client->dev;
++	struct ktd202x *chip;
++	int count;
++	int ret;
++
++	count = device_get_child_node_count(dev);
++	if (!count || count > KTD202X_MAX_LEDS)
++		return dev_err_probe(dev, -EINVAL, "Incorrect number of leds (%d)", count);
++
++	chip = devm_kzalloc(dev, struct_size(chip, leds, count), GFP_KERNEL);
++	if (!chip)
++		return -ENOMEM;
++
++	chip->dev = dev;
++	i2c_set_clientdata(client, chip);
++
++	chip->regmap = devm_regmap_init_i2c(client, &ktd202x_regmap_config);
++	if (IS_ERR(chip->regmap)) {
++		ret = dev_err_probe(dev, PTR_ERR(chip->regmap),
++				    "Failed to allocate register map.\n");
++		return ret;
++	}
++
++	ret = devm_mutex_init(dev, &chip->mutex);
++	if (ret)
++		return ret;
++
++	chip->num_leds = (unsigned long)i2c_get_match_data(client);
++
++	chip->regulators[0].supply = "vin";
++	chip->regulators[1].supply = "vio";
++	ret = devm_regulator_bulk_get(dev, ARRAY_SIZE(chip->regulators), chip->regulators);
++	if (ret < 0) {
++		dev_err_probe(dev, ret, "Failed to request regulators.\n");
++		return ret;
++	}
++
++	ret = regulator_bulk_enable(ARRAY_SIZE(chip->regulators), chip->regulators);
++	if (ret) {
++		dev_err_probe(dev, ret, "Failed to enable regulators.\n");
++		return ret;
++	}
++
++	ret = ktd202x_probe_fw(chip);
++	if (ret < 0) {
++		regulator_bulk_disable(ARRAY_SIZE(chip->regulators), chip->regulators);
++		return ret;
++	}
++
++	ret = regulator_bulk_disable(ARRAY_SIZE(chip->regulators), chip->regulators);
++	if (ret) {
++		dev_err_probe(dev, ret, "Failed to disable regulators.\n");
++		return ret;
++	}
++
++	return 0;
++}
++
++static void ktd202x_remove(struct i2c_client *client)
++{
++	struct ktd202x *chip = i2c_get_clientdata(client);
++
++	ktd202x_chip_disable(chip);
++}
++
++static void ktd202x_shutdown(struct i2c_client *client)
++{
++	struct ktd202x *chip = i2c_get_clientdata(client);
++
++	/* Reset registers to make sure all LEDs are off before shutdown */
++	regmap_write(chip->regmap, KTD202X_REG_RESET_CONTROL, KTD202X_RSTR_RESET);
++}
++
++static const struct i2c_device_id ktd202x_id[] = {
++	{"ktd2026", KTD2026_NUM_LEDS},
++	{"ktd2027", KTD2027_NUM_LEDS},
++	{}
++};
++MODULE_DEVICE_TABLE(i2c, ktd202x_id);
++
++static const struct of_device_id ktd202x_match_table[] = {
++	{ .compatible = "kinetic,ktd2026", .data = (void *)KTD2026_NUM_LEDS },
++	{ .compatible = "kinetic,ktd2027", .data = (void *)KTD2027_NUM_LEDS },
++	{}
++};
++MODULE_DEVICE_TABLE(of, ktd202x_match_table);
++
++static struct i2c_driver ktd202x_driver = {
++	.driver = {
++		.name = "leds-ktd202x",
++		.of_match_table = ktd202x_match_table,
++	},
++	.probe = ktd202x_probe,
++	.remove = ktd202x_remove,
++	.shutdown = ktd202x_shutdown,
++	.id_table = ktd202x_id,
++};
++module_i2c_driver(ktd202x_driver);
++
++MODULE_AUTHOR("André Apitzsch <git@apitzsch.eu>");
++MODULE_DESCRIPTION("Kinetic KTD2026/7 LED driver");
++MODULE_LICENSE("GPL");
+diff --git a/drivers/leds/trigger/Kconfig b/drivers/leds/trigger/Kconfig
+index 2a57328ec..b08b27459 100644
+--- a/drivers/leds/trigger/Kconfig
++++ b/drivers/leds/trigger/Kconfig
+@@ -155,4 +155,20 @@ config LEDS_TRIGGER_TTY
+ 
+ 	  When build as a module this driver will be called ledtrig-tty.
+ 
++config LEDS_TRIGGER_INPUT_EVENTS
++	tristate "LED Input events trigger"
++	depends on INPUT
++	help
++	  Turn LEDs on when there is input (/dev/input/event*) activity and turn
++	  them back off again after there has been no activity for 5 seconds.
++
++	  This is primarily intended to control LEDs which are a backlight for
++	  capacitive touch-buttons, such as e.g. the menu / home / back buttons
++	  found on the bottom bezel of many older smartphones and tablets.
++
++	  This can also be used to turn on the keyboard backlight LED on
++	  input events and turn the keyboard backlight off again when idle.
++
++	  When build as a module this driver will be called ledtrig-input-events.
++
+ endif # LEDS_TRIGGERS
+diff --git a/drivers/leds/trigger/Makefile b/drivers/leds/trigger/Makefile
+index 25c4db97c..f78a3077e 100644
+--- a/drivers/leds/trigger/Makefile
++++ b/drivers/leds/trigger/Makefile
+@@ -16,3 +16,4 @@ obj-$(CONFIG_LEDS_TRIGGER_NETDEV)	+= ledtrig-netdev.o
+ obj-$(CONFIG_LEDS_TRIGGER_PATTERN)	+= ledtrig-pattern.o
+ obj-$(CONFIG_LEDS_TRIGGER_AUDIO)	+= ledtrig-audio.o
+ obj-$(CONFIG_LEDS_TRIGGER_TTY)		+= ledtrig-tty.o
++obj-$(CONFIG_LEDS_TRIGGER_INPUT_EVENTS)	+= ledtrig-input-events.o
+diff --git a/drivers/leds/trigger/ledtrig-input-events.c b/drivers/leds/trigger/ledtrig-input-events.c
+new file mode 100644
+index 000000000..1c7973156
+--- /dev/null
++++ b/drivers/leds/trigger/ledtrig-input-events.c
+@@ -0,0 +1,165 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Input Events LED trigger
++ *
++ * Copyright (C) 2024 Hans de Goede <hansg@kernel.org>
++ */
++
++#include <linux/input.h>
++#include <linux/jiffies.h>
++#include <linux/leds.h>
++#include <linux/module.h>
++#include <linux/moduleparam.h>
++#include <linux/slab.h>
++#include <linux/spinlock.h>
++#include <linux/workqueue.h>
++#include "../leds.h"
++
++static unsigned long led_off_delay_ms = 5000;
++module_param(led_off_delay_ms, ulong, 0644);
++MODULE_PARM_DESC(led_off_delay_ms,
++	"Specify delay in ms for turning LEDs off after last input event");
++
++static struct input_events_data {
++	struct delayed_work work;
++	spinlock_t lock;
++	/* To avoid repeatedly setting the brightness while there are events */
++	bool led_on;
++	unsigned long led_off_time;
++} input_events_data;
++
++static struct led_trigger *input_events_led_trigger;
++
++static void led_input_events_work(struct work_struct *work)
++{
++	struct input_events_data *data =
++		container_of(work, struct input_events_data, work.work);
++
++	spin_lock_irq(&data->lock);
++
++	/*
++	 * This time_after_eq() check avoids a race where this work starts
++	 * running before a new event pushed led_off_time back.
++	 */
++	if (time_after_eq(jiffies, data->led_off_time)) {
++		led_trigger_event(input_events_led_trigger, LED_OFF);
++		data->led_on = false;
++	}
++
++	spin_unlock_irq(&data->lock);
++}
++
++static void input_events_event(struct input_handle *handle, unsigned int type,
++			       unsigned int code, int val)
++{
++	struct input_events_data *data = &input_events_data;
++	unsigned long led_off_delay = msecs_to_jiffies(led_off_delay_ms);
++	unsigned long flags;
++
++	spin_lock_irqsave(&data->lock, flags);
++
++	if (!data->led_on) {
++		led_trigger_event(input_events_led_trigger, LED_FULL);
++		data->led_on = true;
++	}
++	data->led_off_time = jiffies + led_off_delay;
++
++	spin_unlock_irqrestore(&data->lock, flags);
++
++	mod_delayed_work(system_wq, &data->work, led_off_delay);
++}
++
++static int input_events_connect(struct input_handler *handler, struct input_dev *dev,
++				const struct input_device_id *id)
++{
++	struct input_handle *handle;
++	int ret;
++
++	handle = kzalloc(sizeof(*handle), GFP_KERNEL);
++	if (!handle)
++		return -ENOMEM;
++
++	handle->dev = dev;
++	handle->handler = handler;
++	handle->name = KBUILD_MODNAME;
++
++	ret = input_register_handle(handle);
++	if (ret)
++		goto err_free_handle;
++
++	ret = input_open_device(handle);
++	if (ret)
++		goto err_unregister_handle;
++
++	return 0;
++
++err_unregister_handle:
++	input_unregister_handle(handle);
++err_free_handle:
++	kfree(handle);
++	return ret;
++}
++
++static void input_events_disconnect(struct input_handle *handle)
++{
++	input_close_device(handle);
++	input_unregister_handle(handle);
++	kfree(handle);
++}
++
++static const struct input_device_id input_events_ids[] = {
++	{
++		.flags = INPUT_DEVICE_ID_MATCH_EVBIT,
++		.evbit = { BIT_MASK(EV_KEY) },
++	},
++	{
++		.flags = INPUT_DEVICE_ID_MATCH_EVBIT,
++		.evbit = { BIT_MASK(EV_REL) },
++	},
++	{
++		.flags = INPUT_DEVICE_ID_MATCH_EVBIT,
++		.evbit = { BIT_MASK(EV_ABS) },
++	},
++	{ }
++};
++
++static struct input_handler input_events_handler = {
++	.name = KBUILD_MODNAME,
++	.event = input_events_event,
++	.connect = input_events_connect,
++	.disconnect = input_events_disconnect,
++	.id_table = input_events_ids,
++};
++
++static int __init input_events_init(void)
++{
++	int ret;
++
++	INIT_DELAYED_WORK(&input_events_data.work, led_input_events_work);
++	spin_lock_init(&input_events_data.lock);
++
++	led_trigger_register_simple("input-events", &input_events_led_trigger);
++
++	ret = input_register_handler(&input_events_handler);
++	if (ret) {
++		led_trigger_unregister_simple(input_events_led_trigger);
++		return ret;
++	}
++
++	return 0;
++}
++
++static void __exit input_events_exit(void)
++{
++	input_unregister_handler(&input_events_handler);
++	cancel_delayed_work_sync(&input_events_data.work);
++	led_trigger_unregister_simple(input_events_led_trigger);
++}
++
++module_init(input_events_init);
++module_exit(input_events_exit);
++
++MODULE_AUTHOR("Hans de Goede <hansg@kernel.org>");
++MODULE_DESCRIPTION("Input Events LED trigger");
++MODULE_LICENSE("GPL");
++MODULE_ALIAS("ledtrig:input-events");
+diff --git a/drivers/platform/x86/x86-android-tablets/other.c b/drivers/platform/x86/x86-android-tablets/other.c
+index 333e8e65f..76d008a15 100644
+--- a/drivers/platform/x86/x86-android-tablets/other.c
++++ b/drivers/platform/x86/x86-android-tablets/other.c
+@@ -11,7 +11,9 @@
+ #include <linux/acpi.h>
+ #include <linux/gpio/machine.h>
+ #include <linux/input.h>
++#include <linux/leds.h>
+ #include <linux/platform_device.h>
++#include <linux/pwm.h>
+ 
+ #include "shared-psy-info.h"
+ #include "x86-android-tablets.h"
+@@ -592,6 +594,132 @@ const struct x86_dev_info whitelabel_tm800a550l_info __initconst = {
+ 	.gpiod_lookup_tables = whitelabel_tm800a550l_gpios,
+ };
+ 
++/*
++ * The firmware node for ktd2026 on Xaomi pad2. It composed of a RGB LED node
++ * with three subnodes for each color (B/G/R). The RGB LED node is named
++ * "multi-led" to align with the name in the device tree.
++ */
++
++/* Main firmware node for ktd2026 */
++static const struct software_node ktd2026_node = {
++	.name = "ktd2026",
++};
++
++static const struct property_entry ktd2026_rgb_led_props[] = {
++	PROPERTY_ENTRY_U32("reg", 0),
++	PROPERTY_ENTRY_U32("color", LED_COLOR_ID_RGB),
++	PROPERTY_ENTRY_STRING("label", "mipad2:rgb:indicator"),
++	PROPERTY_ENTRY_STRING("linux,default-trigger", "bq27520-0-charging-orange-full-green"),
++	{ }
++};
++
++static const struct software_node ktd2026_rgb_led_node = {
++	.name = "multi-led",
++	.properties = ktd2026_rgb_led_props,
++	.parent = &ktd2026_node,
++};
++
++static const struct property_entry ktd2026_blue_led_props[] = {
++	PROPERTY_ENTRY_U32("reg", 0),
++	PROPERTY_ENTRY_U32("color", LED_COLOR_ID_BLUE),
++	{ }
++};
++
++static const struct software_node ktd2026_blue_led_node = {
++	.properties = ktd2026_blue_led_props,
++	.parent = &ktd2026_rgb_led_node,
++};
++
++static const struct property_entry ktd2026_green_led_props[] = {
++	PROPERTY_ENTRY_U32("reg", 1),
++	PROPERTY_ENTRY_U32("color", LED_COLOR_ID_GREEN),
++	{ }
++};
++
++static const struct software_node ktd2026_green_led_node = {
++	.properties = ktd2026_green_led_props,
++	.parent = &ktd2026_rgb_led_node,
++};
++
++static const struct property_entry ktd2026_red_led_props[] = {
++	PROPERTY_ENTRY_U32("reg", 2),
++	PROPERTY_ENTRY_U32("color", LED_COLOR_ID_RED),
++	{ }
++};
++
++static const struct software_node ktd2026_red_led_node = {
++	.properties = ktd2026_red_led_props,
++	.parent = &ktd2026_rgb_led_node,
++};
++
++static const struct software_node *ktd2026_node_group[] = {
++	&ktd2026_node,
++	&ktd2026_rgb_led_node,
++	&ktd2026_red_led_node,
++	&ktd2026_green_led_node,
++	&ktd2026_blue_led_node,
++	NULL
++};
++
++/*
++ * For the LEDs which backlight the Menu / Home / Back capacitive buttons on
++ * the bottom bezel. These are attached to a TPS61158 LED controller which
++ * is controlled by the "pwm_soc_lpss_2" PWM output.
++ */
++#define XIAOMI_MIPAD2_LED_PERIOD_NS		19200
++#define XIAOMI_MIPAD2_LED_MAX_DUTY_NS		 6000 /* From Android kernel */
++
++static struct pwm_device *xiaomi_mipad2_led_pwm;
++
++static int xiaomi_mipad2_brightness_set(struct led_classdev *led_cdev,
++					enum led_brightness val)
++{
++	struct pwm_state state = {
++		.period = XIAOMI_MIPAD2_LED_PERIOD_NS,
++		.duty_cycle = XIAOMI_MIPAD2_LED_MAX_DUTY_NS * val / LED_FULL,
++		/* Always set PWM enabled to avoid the pin floating */
++		.enabled = true,
++	};
++
++	return pwm_apply_might_sleep(xiaomi_mipad2_led_pwm, &state);
++}
++
++static int __init xiaomi_mipad2_init(struct device *dev)
++{
++	struct led_classdev *led_cdev;
++	int ret;
++
++	xiaomi_mipad2_led_pwm = devm_pwm_get(dev, "pwm_soc_lpss_2");
++	if (IS_ERR(xiaomi_mipad2_led_pwm))
++		return dev_err_probe(dev, PTR_ERR(xiaomi_mipad2_led_pwm), "getting pwm\n");
++
++	led_cdev = devm_kzalloc(dev, sizeof(*led_cdev), GFP_KERNEL);
++	if (!led_cdev)
++		return -ENOMEM;
++
++	led_cdev->name = "mipad2:white:touch-buttons-backlight";
++	led_cdev->max_brightness = LED_FULL;
++	led_cdev->default_trigger = "input-events";
++	led_cdev->brightness_set_blocking = xiaomi_mipad2_brightness_set;
++	/* Turn LED off during suspend */
++	led_cdev->flags = LED_CORE_SUSPENDRESUME;
++
++	ret = devm_led_classdev_register(dev, led_cdev);
++	if (ret)
++		return dev_err_probe(dev, ret, "registering LED\n");
++
++	ret = software_node_register_node_group(ktd2026_node_group);
++	if (ret)
++		return dev_err_probe(dev, ret, "registering node_group\n");
++
++	return 0;
++}
++
++static void xiaomi_mipad2_exit(void)
++{
++	software_node_unregister_node_group(ktd2026_node_group);
++}
++
+ /*
+  * If the EFI bootloader is not Xiaomi's own signed Android loader, then the
+  * Xiaomi Mi Pad 2 X86 tablet sets OSID in the DSDT to 1 (Windows), causing
+@@ -615,6 +743,7 @@ static const struct x86_i2c_client_info xiaomi_mipad2_i2c_clients[] __initconst
+ 			.type = "ktd2026",
+ 			.addr = 0x30,
+ 			.dev_name = "ktd2026",
++			.swnode = &ktd2026_node,
+ 		},
+ 		.adapter_path = "\\_SB_.PCI0.I2C3",
+ 	},
+@@ -623,4 +752,6 @@ static const struct x86_i2c_client_info xiaomi_mipad2_i2c_clients[] __initconst
+ const struct x86_dev_info xiaomi_mipad2_info __initconst = {
+ 	.i2c_client_info = xiaomi_mipad2_i2c_clients,
+ 	.i2c_client_count = ARRAY_SIZE(xiaomi_mipad2_i2c_clients),
++	.init = xiaomi_mipad2_init,
++	.exit = xiaomi_mipad2_exit,
+ };
+-- 
+2.53.0
+

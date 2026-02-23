@@ -22,6 +22,10 @@ apply_patches()
 	done
 
 	for patch in ./kernel-patches/"$1"/*.patch; do
+		if [ ! -f "$patch" ]; then
+			echo -e "${BLUE_COLOR}Kernel $1: $path patch not found, Skip$NORMAL_COLOR"
+			continue
+		fi
 		echo -e "${BLUE_COLOR}Applying patch: $patch$NORMAL_COLOR"
 		patch -d"./kernels/$1" -p1 --no-backup-if-mismatch -N < "$patch" || { echo -e "${RED_COLOR}Kernel $1 patch $patch failed$NORMAL_COLOR"; exit 1; }
 	done
@@ -44,7 +48,8 @@ download_and_patch_kernels()
 	for kernel in $kernels; do
 		kernel_remote_path=${kernel_info["$kernel,url"]}
 		kernel_remote_branch=${kernel_info["$kernel,branch"]}
-		echo -e "${BLUE_COLOR}kernel_remote_path=$kernel_remote_path$NORMAL_COLOR"
+		echo -e "${BLUE_COLOR}kernel_remote_path   = $kernel_remote_path$NORMAL_COLOR"
+		echo -e "${BLUE_COLOR}kernel_remote_branch = $kernel_remote_branch$NORMAL_COLOR"
 
 		git clone --depth=1 --single-branch $kernel_remote_path -b $kernel_remote_branch --recursive ./kernels/$kernel || { echo -e "${RED_COLOR}Download kernel $kernel failed!$NORMAL_COLOR"; exit 1; }
 
@@ -83,5 +88,5 @@ declare -A kernel_info=(
 	["6.15,branch"]="6.15"
 )
 
-kernels="${@:-5.10 6.12}"
+kernels="${@:-6.6 6.12}"
 download_and_patch_kernels

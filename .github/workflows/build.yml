@@ -5,11 +5,12 @@ on:
       kernel:
         required: true
         description: 'select kernel version'
-        default: '6.15'
+        default: '6.12'
         type: choice
         options:
         - "6.12"
-        - "6.15"
+        - "6.6"
+        - "5.10"
   push:
     branches:
       - 'main'

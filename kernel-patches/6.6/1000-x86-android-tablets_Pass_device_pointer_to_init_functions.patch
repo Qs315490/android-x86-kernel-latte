@@ -1,0 +1,88 @@
+diff --git a/drivers/platform/x86/x86-android-tablets/core.c b/drivers/platform/x86/x86-android-tablets/core.c
+index 63a348af8..3305afdaf 100644
+--- a/drivers/platform/x86/x86-android-tablets/core.c
++++ b/drivers/platform/x86/x86-android-tablets/core.c
+@@ -305,7 +305,7 @@ static __init int x86_android_tablet_probe(struct platform_device *pdev)
+ 		gpiod_add_lookup_table(gpiod_lookup_tables[i]);
+ 
+ 	if (dev_info->init) {
+-		ret = dev_info->init();
++		ret = dev_info->init(&pdev->dev);
+ 		if (ret < 0) {
+ 			x86_android_tablet_remove(pdev);
+ 			return ret;
+diff --git a/drivers/platform/x86/x86-android-tablets/lenovo.c b/drivers/platform/x86/x86-android-tablets/lenovo.c
+index 26a4ef670..838585a8d 100644
+--- a/drivers/platform/x86/x86-android-tablets/lenovo.c
++++ b/drivers/platform/x86/x86-android-tablets/lenovo.c
+@@ -205,7 +205,7 @@ static struct gpiod_lookup_table * const lenovo_yb1_x90_gpios[] = {
+ 	NULL
+ };
+ 
+-static int __init lenovo_yb1_x90_init(void)
++static int __init lenovo_yb1_x90_init(struct device *dev)
+ {
+ 	/* Enable the regulators used by the touchscreens */
+ 
+@@ -386,7 +386,7 @@ static struct gpiod_lookup_table * const lenovo_yoga_tab2_830_1050_gpios[] = {
+ 	NULL
+ };
+ 
+-static int __init lenovo_yoga_tab2_830_1050_init(void);
++static int __init lenovo_yoga_tab2_830_1050_init(struct device *dev);
+ static void lenovo_yoga_tab2_830_1050_exit(void);
+ 
+ const struct x86_dev_info lenovo_yoga_tab2_830_1050_info __initconst = {
+@@ -507,7 +507,7 @@ static int lenovo_yoga_tab2_830_1050_power_off(struct sys_off_data *data)
+ 	return NOTIFY_DONE;
+ }
+ 
+-static int __init lenovo_yoga_tab2_830_1050_init(void)
++static int __init lenovo_yoga_tab2_830_1050_init(struct device *dev)
+ {
+ 	int ret;
+ 
+@@ -653,7 +653,7 @@ static const struct x86_i2c_client_info lenovo_yt3_i2c_clients[] __initconst = {
+ 	}
+ };
+ 
+-static int __init lenovo_yt3_init(void)
++static int __init lenovo_yt3_init(struct device *dev)
+ {
+ 	struct gpio_desc *gpiod;
+ 	int ret;
+diff --git a/drivers/platform/x86/x86-android-tablets/other.c b/drivers/platform/x86/x86-android-tablets/other.c
+index 23e4426cb..b7f928ee9 100644
+--- a/drivers/platform/x86/x86-android-tablets/other.c
++++ b/drivers/platform/x86/x86-android-tablets/other.c
+@@ -178,7 +178,7 @@ static const struct x86_i2c_client_info chuwi_hi8_i2c_clients[] __initconst = {
+ 	},
+ };
+ 
+-static int __init chuwi_hi8_init(void)
++static int __init chuwi_hi8_init(struct device *dev)
+ {
+ 	/*
+ 	 * Avoid the acpi_unregister_gsi() call in x86_acpi_irq_helper_get()
+@@ -239,7 +239,7 @@ const struct x86_dev_info cyberbook_t116_info __initconst = {
+ #define CZC_EC_EXTRA_PORT	0x68
+ #define CZC_EC_ANDROID_KEYS	0x63
+ 
+-static int __init czc_p10t_init(void)
++static int __init czc_p10t_init(struct device *dev)
+ {
+ 	/*
+ 	 * The device boots up in "Windows 7" mode, when the home button sends a
+diff --git a/drivers/platform/x86/x86-android-tablets/x86-android-tablets.h b/drivers/platform/x86/x86-android-tablets/x86-android-tablets.h
+index e46e1128a..adf34fe89 100644
+--- a/drivers/platform/x86/x86-android-tablets/x86-android-tablets.h
++++ b/drivers/platform/x86/x86-android-tablets/x86-android-tablets.h
+@@ -78,7 +78,7 @@ struct x86_dev_info {
+ 	int pdev_count;
+ 	int serdev_count;
+ 	int gpio_button_count;
+-	int (*init)(void);
++	int (*init)(struct device *dev);
+ 	void (*exit)(void);
+ };
+ 
